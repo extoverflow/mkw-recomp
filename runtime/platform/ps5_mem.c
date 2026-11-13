@@ -144,6 +144,7 @@ static VqEntry st_fail_entry;   // what the kernel has at the last failed page (
 // console allows a process ~16k of them: --ps5-map-test (3), 13/11/2026), and those backed as whole blocks.
 static uint8_t st_region_bits[PS_LIMIT / BLOCK / 8];
 static uint64_t st_regions, st_region_blocks;
+static int64_t st_guest_now;   // bytes of guest memory backed right now (backed less given back)
 static inline void st_add(uint64_t *v, uint64_t d) { __atomic_fetch_add(v, d, __ATOMIC_RELAXED); }
 
 static int kprot(void *a, size_t n, int prot) {   // mprotect, counted
@@ -182,6 +183,7 @@ static int back_run(uint64_t k, uint64_t n) {
     }
     memset(at, 0, n);   // direct memory is not cleared for us
     st_add(&st_back_ns, plat_now_ns() - t0);
+    __atomic_add_fetch(&st_guest_now, (int64_t)n, __ATOMIC_RELAXED);
     if (k < PS_LIMIT) {
         uint64_t r = k / BLOCK;
         if (n >= BLOCK) st_add(&st_region_blocks, 1);
@@ -231,6 +233,7 @@ static void unback(uint64_t k) {
     if (!c || !(c->backed[i / 8] >> (i % 8) & 1)) return;
     void *at = (void *)(uintptr_t)k;
     st_add(&st_unback_n, 1);
+    __atomic_sub_fetch(&st_guest_now, (int64_t)KP, __ATOMIC_RELAXED);
     int rr = sceKernelReserveVirtualRange(&at, KP, MAP_FIXED, KP);
     if (rr || at != (void *)(uintptr_t)k) st_add(&st_unback_fail, 1), st_unback_r = rr;
     if (c->phys && c->phys[i]) {
@@ -693,8 +696,9 @@ uint64_t ps5_mem_sibling_lifts(void) { return __atomic_load_n(&sibling_lifts, __
 // The counters above as one line for the title's memory report (ps5_main.c).
 // One short line for the page-table sampler (ps5_main.c pt_watch): guest backing so far.
 int ps5_mem_brief(char *out, size_t cap) {
-    return snprintf(out, cap, "guest: backing %llu calls %.1f MiB, stretches with pages %llu, blocks %llu, unback %llu, "
+    return snprintf(out, cap, "guest: %.1f MiB backed now; backing %llu calls %.1f MiB, stretches with pages %llu, blocks %llu, unback %llu, "
                     "failed %llu",
+                    __atomic_load_n(&st_guest_now, __ATOMIC_RELAXED) / 1048576.0,
                     (unsigned long long)__atomic_load_n(&st_back_n, __ATOMIC_RELAXED),
                     __atomic_load_n(&st_back_bytes, __ATOMIC_RELAXED) / 1048576.0,
                     (unsigned long long)__atomic_load_n(&st_regions, __ATOMIC_RELAXED),
@@ -711,8 +715,9 @@ int ps5_mem_stats(char *out, size_t cap) {
     e.name[sizeof e.name - 1] = 0;
     int ct = -1, cf = -1, gt = -1, gf = -1;
     (void)sceKernelGetPageTableStats(&ct, &cf, &gt, &gf);
-    int k = snprintf(out, cap, "page tables cpu %d free %d, gpu %d free %d; 2 MiB stretches with 16 KiB backings %llu, whole 2 MiB blocks %llu; query of the last failed page %#x: %p-%p offset %#llx prot %#x type %d flags %#x '%s'; ",
-                     ct, cf, gt, gf, (unsigned long long)st_regions, (unsigned long long)st_region_blocks, (unsigned)st_fail_vq, e.start, e.end, (unsigned long long)e.offset, (unsigned)e.protection, e.type,
+    int k = snprintf(out, cap, "guest backed now %.1f MiB; page tables cpu %d free %d, gpu %d free %d; 2 MiB stretches with 16 KiB backings %llu, whole 2 MiB blocks %llu; query of the last failed page %#x: %p-%p offset %#llx prot %#x type %d flags %#x '%s'; ",
+                     __atomic_load_n(&st_guest_now, __ATOMIC_RELAXED) / 1048576.0, ct, cf, gt, gf,
+                     (unsigned long long)st_regions, (unsigned long long)st_region_blocks, (unsigned)st_fail_vq, e.start, e.end, (unsigned long long)e.offset, (unsigned)e.protection, e.type,
                      (unsigned)e.flags, e.name);
     if (k < 0 || (size_t)k >= cap) return k;
     out += k, cap -= (size_t)k;
