@@ -665,6 +665,15 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
     Dl_info at = {0}, self = {0};
     int in_module = dladdr((void *)rip, &at) != 0, ours = 0;
     if (in_module && dladdr((void *)plat_crash_hook, &self)) ours = at.dli_fbase == self.dli_fbase;
+    {   // A raw line first: the crash report below takes the log stream's and the heap's locks, and a thread stopped
+        // holding one of them turned crashes into hangs with nothing logged (play test p4: picture frozen, log and
+        // thread dump silent). write(2) takes no lock.
+        char raw[200];
+        int n = snprintf(raw, sizeof raw, "[host] ps5: fatal signal %d at %#lx (exe+%#lx) addr %p err %#lx rsp %#lx\n",
+                         sig, (unsigned long)rip, (unsigned long)(in_module ? rip - (uintptr_t)at.dli_fbase : rip),
+                         si->si_addr, (unsigned long)err, (unsigned long)u->uc_mcontext.mc_rsp);
+        if (n > 0) (void)!write(ps5_log_fd, raw, (size_t)n < sizeof raw ? (size_t)n : sizeof raw - 1);
+    }
     if (crash_fn && (!in_module || ours)) {
         PlatCrash c = {sig == SIGSEGV ? "access violation" : sig == SIGBUS ? "bus error"
                        : sig == SIGILL ? "illegal instruction" : "arithmetic exception",
