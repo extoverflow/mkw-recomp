@@ -24,3 +24,5 @@ int ps5_mem_writable(uint64_t a, uint64_t n, char *why, size_t cap);
 // pointer and the code addresses on its stack to fd (write(2), no stdio).
 void ps5_dump_register(const char *name);
 void ps5_dump_threads(int fd);
+// The threads named name, count times every interval_ms (a profile of one thread), to fd.
+void ps5_dump_sample(int fd, const char *name, int count, int interval_ms);
