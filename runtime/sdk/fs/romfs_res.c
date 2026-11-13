@@ -106,9 +106,10 @@ static const char *find_archive(void) {
     }
 }
 
-// The overlay directory for MKW_RESOLUTION (lines, 0: the game's) and the detail distance (lod, 0: the game's), written
-// when missing; NULL when it cannot be made.
-static const char *write_overlay(int lines, float lod) {
+// The overlay directory for MKW_RESOLUTION (lines, 0: the game's), the 3D scene's lines (scene: 0 as the screen's,
+// -1 the game's; MKW_RESOLUTION_3D) and the detail distance (lod, 0: the game's), written when missing; NULL when it
+// cannot be made.
+static const char *write_overlay(int lines, int scene, float lod) {
     static char dir[PLAT_PATH_MAX * 2];
     char path[PLAT_PATH_MAX * 3], man[PLAT_PATH_MAX * 3];
     const char *exe = cfg_game_dir();
@@ -127,8 +128,12 @@ static const char *write_overlay(int lines, float lod) {
     sha256(z, zn, ssha);
     hex(ssha, shex);
     const char *mode = ov_handheld() ? "-handheld" : "";   // its own For3D, so its own directory
-    if (lod > 0) snprintf(dir, sizeof dir, "%s/cache/graphics-r%d%s-lod%g", exe, lines, mode, (double)lod);
-    else snprintf(dir, sizeof dir, "%s/cache/resolution-%d%s", exe, lines, mode);
+    char s3[24] = "";   // the 3D scene's own choice, its own directory too
+    if (scene) snprintf(s3, sizeof s3, scene < 0 ? "-3d-game" : "-3d%d", scene);
+    // the 3D lines For3D gets: 0 leaves the game's fields
+    uint32_t r3d = scene < 0 ? 0 : lines_3d(scene ? scene : lines);
+    if (lod > 0) snprintf(dir, sizeof dir, "%s/cache/graphics-r%d%s%s-lod%g", exe, lines, s3, mode, (double)lod);
+    else snprintf(dir, sizeof dir, "%s/cache/resolution-%d%s%s", exe, lines, s3, mode);
     snprintf(man, sizeof man, "%s/manifest.tsv", dir);
     uint64_t mn = 0;
     char *old = (char *)plat_file_read(man, &mn);
@@ -136,8 +141,8 @@ static const char *write_overlay(int lines, float lod) {
     free(old);
     if (fresh) {   // the log still names the mode and the overlay used
         free(z);
-        rt_log("resolution: %d lines (3D %u, screen %d, %s), detail distance %g: written before in %s", lines,
-               (unsigned)lines_3d(lines), lines, ov_handheld() ? "handheld" : "docked", (double)lod, dir);
+        rt_log("resolution: %d lines (3D %s%u, screen %d, %s), detail distance %g: written before in %s", lines,
+               r3d ? "" : "the game's ", (unsigned)r3d, lines, ov_handheld() ? "handheld" : "docked", (double)lod, dir);
         return dir;
     }
     unsigned long long rn = ZSTD_getFrameContentSize(z, zn);
@@ -149,7 +154,6 @@ static const char *write_overlay(int lines, float lod) {
     int changed = 0;
     if (at && mlen > 16 && !memcmp(s + at, "YB", 2)) {
         uint32_t keys_off = u32(s + at + 4), root = u32(s + at + 12);
-        uint32_t r3d = lines_3d(lines);
         changed = patch_dict(s + at, mlen, keys_off, root, "", r3d, (uint32_t)(lines > 0 ? lines : 0), lod, 0);
     }
     if (!changed) { free(s); rt_log("resolution: no resolution fields in %s", MEMBER); return NULL; }
@@ -169,8 +173,9 @@ static const char *write_overlay(int lines, float lod) {
     int ok = plat_file_write_atomic(path, out, on) && plat_file_write_atomic(man, line, strlen(line));
     free(out);
     if (!ok) { rt_log("resolution: cannot write %s", dir); return NULL; }
-    rt_log("resolution: %d lines (3D %u, screen %d, %s), detail distance %g: %d fields in %s", lines,
-           (unsigned)lines_3d(lines), lines, ov_handheld() ? "handheld" : "docked", (double)lod, changed, dir);
+    rt_log("resolution: %d lines (3D %s%u, screen %d, %s), detail distance %g: %d fields in %s", lines,
+           r3d ? "" : "the game's ", (unsigned)r3d, lines, ov_handheld() ? "handheld" : "docked", (double)lod, changed,
+           dir);
     return dir;
 }
 
@@ -184,8 +189,12 @@ const char *romfs_resolution_overlay(void) {
     // console's value writes nothing
     float lod = (float)cfg_double("MKW_DETAIL_DISTANCE");
     if (lod == 2.0f) lod = 0;
+    // MKW_RESOLUTION_3D: the 3D scene's lines apart from the screen's ("same": as MKW_RESOLUTION, "original": the
+    // game's). The PS5 keeps the game's scene with 1080-line screen passes (cfg.c PS5 profile).
+    const char *v3 = cfg_get("MKW_RESOLUTION_3D");
+    int scene = !v3 || !*v3 || !strcmp(v3, "same") ? 0 : !strcmp(v3, "original") ? -1 : atoi(v3);
     if (!lines && lod <= 0) return NULL;
-    const char *dir = write_overlay(lines, lod);
+    const char *dir = write_overlay(lines, scene, lod);
     if (dir && lines) g_lines = lines;
     return dir;
 }
