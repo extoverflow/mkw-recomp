@@ -324,13 +324,14 @@ def port_version() -> str:
     return r.stdout.strip().removeprefix("v") if r.returncode == 0 and r.stdout.strip() else "dev"
 
 
-def defaults_glue(exefs: Path, romfs: Path, dist: bool) -> str:
+def defaults_glue(exefs: Path, romfs: Path, dist: bool, no_paths: bool = False) -> str:
     """defaults.c: the executable's own defaults, the game copy's paths (none in the player's build: the folders next
     to the executable, main.c portable_paths) and the port's version. The player's build gets rt_game_builtin here:
-    it has no linked game code, gamelib.c loads the library."""
+    it has no linked game code, gamelib.c loads the library. no_paths (the PS5): no paths either, with the game code
+    linked in: this machine's paths mean nothing on the console (its folder: platform/ps5_sys.c plat_exe_path)."""
     out = ["// Defaults written by tools/build/build.py; do not edit.", '#include "gamelib.h"', '#include "host.h"', ""]
     for name, path in (("exefs", exefs), ("romfs", romfs), ("profile", ROOT / "build/profile")):
-        out.append(f"const char rt_default_{name}[] = {c_string('' if dist else str(path.resolve()))};")
+        out.append(f"const char rt_default_{name}[] = {c_string('' if dist or no_paths else str(path.resolve()))};")
     out += [f"const char rt_port_version[] = {c_string(port_version())};", ""]
     if dist:
         out += ["const RtGame *rt_game_builtin(void) { return 0; }", ""]
@@ -571,7 +572,7 @@ def main() -> None:
     jobs = args.jobs or max(1, min(os.cpu_count() or 1, int(mem_total_gb() * 0.6 / args.job_mem_gb)))
     (args.out / "rt").mkdir(parents=True, exist_ok=True)
     glue = [
-        (args.out / "rt/defaults.c", defaults_glue(args.exefs, args.romfs, dist is not None)),
+        (args.out / "rt/defaults.c", defaults_glue(args.exefs, args.romfs, dist is not None, target is PS5)),
         (args.out / "rt/hud_layouts.h", hud_layouts.header_text()),  # runtime/core/boot/patches.c includes it
     ]
     if not args.runtime_only:
