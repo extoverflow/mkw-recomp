@@ -16,4 +16,12 @@
 | `win32_sys.c` | Windows: process, local IPC (named pipes), desktop and libraries |
 | `win32_load.c` | Windows: machine load (CPU, PDH for temperature and GPU) and desktop shortcut |
 | `common.c`, `fp_x86.h` | Common parts, including absolute high-resolution pacing deadlines, and x86 floating point control |
+| `common.c`, `fp_x86.h` | Common parts, x86 floating point control |
+| `ps5.c`, `ps5_int.h` | PS5: threads (stacks in direct memory, sized from a measurement), interruption by signal, fibers, affinity; the header is what the `ps5*.c` parts share |
+| `ps5_mem.c` | PS5: reservations, direct memory backed at the first touch per 16 KiB page, the 4 KiB guest state, faults and crashes |
+| `ps5_frontend.c` | PS5 until Step 3: stand-ins for the SDL3 front end (no input, no sound out, no window, no start screen) |
+| `ps5_sync.c` | PS5: clock, locks and condition variables (`linux_sync.c` on FreeBSD's `_umtx_op`) |
+| `ps5_fs.c` | PS5: files and file system (`linux_fs.c`; no `renameat2`, the temporary directory under `/data`) |
+| `ps5_sys.c` | PS5: process, libraries, time zone, randomness; no desktop, clipboard, child processes or load counters |
+| `ps5_compat.h` | PS5: declarations the payload SDK's headers lack for functions the console has (`pthread_getname_np`); `build.py --target ps5` includes it first in every file |
 | `mkw.rc`, `mkw.manifest` | `mkw.exe`'s manifest (UTF-8 code page, from totk-pc-recomp); `build.py --target windows` |
