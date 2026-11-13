@@ -125,14 +125,17 @@ PS5 = Target(
     # -msha: clang's intrinsic headers hide SHA on the PS5 target unless the whole file has it (core/base/sha256.c)
     # -isystem: searched after the runtime's -I list, so PS5_LIBS's own imgui.h does not shadow runtime/third_party's
     # IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS: ImGui's link opener forks, and a title has no fork
-    ["-msha", "-DIMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS", f"-include{RUNTIME / 'platform/ps5_compat.h'}",
+    # platform/ps5_sdl: the SDL3 subset input.c and audio_mixer.c call (platform/ps5_sdl.c), the console has no SDL3
+    ["-msha", "-DIMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS", f"-I{RUNTIME / 'platform/ps5_sdl'}",
+     f"-include{RUNTIME / 'platform/ps5_compat.h'}",
      f"-isystem{PS5_LIBS / 'include'}",
      f"-isystem{ROOT / 'build/ps5-deps/include'}"],
     [], [],
     ROOT / "scratchpad/vma",
 )  # fmt: skip
-# The SDL3 front end (window, input, sound, start screen, menus): not on the PS5 until it has its own (runtime/...).
-PS5_WITHOUT = {"audio/audio_mixer.c", "gfx/nvn/host/gfx_window_sdl.c", "input/input.c",
+# The SDL3 front end's window, keyboard, start screen and menu events: not on the PS5 (platform/ps5_window.c is its
+# window; input.c and audio_mixer.c build against platform/ps5_sdl's SDL3 subset).
+PS5_WITHOUT = {"gfx/nvn/host/gfx_window_sdl.c",
                "input/input_sdl.c", "third_party/imgui/backends/imgui_impl_sdl3.cpp",
                "third_party/imgui/backends/imgui_impl_sdlrenderer3.cpp", "ui/launcher/launcher.cpp",
                "ui/launcher/launcher_backdrop.cpp", "ui/launcher/launcher_setup.cpp", "ui/launcher/launcher_update.cpp",
