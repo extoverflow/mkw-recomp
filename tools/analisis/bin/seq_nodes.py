@@ -22,7 +22,7 @@ sys.path[:0] = ["recomp", "tools/gpu"]
 from module import Module
 from nso import R_AARCH64_RELATIVE
 
-BASE = 0x7000000000
+BASE = 0x3000000000   # recomp/layout.py FIRST_BASE
 
 
 def main() -> None:

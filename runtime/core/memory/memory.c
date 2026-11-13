@@ -20,7 +20,7 @@
 
 #define PAGE 0x1000ull
 #define GiB (1ull << 30)
-#define LOW_SEARCH_FROM 0x100000000ull
+#define LOW_SEARCH_FROM 0x300000000ull   // above RADV's 32-bit window in a PS5 title (host.h)
 #define LOW_SIZE (14 * GiB)        // stack + heap block: the heap of a Switch 2 title nears 8 GiB
 #define STACK_OFF 0x10000000ull
 #define STACK_SIZE 0x10000000ull
