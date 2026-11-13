@@ -90,6 +90,9 @@ static void memory_report(const char *when) {
 // (reassigning the stdout pointer does not move printf: title run 2). Both are opened for appending, so their lines
 // interleave. Returns whether the log took descriptors 1 and 2; if not, the streams are reopened onto it.
 static int log_open(void) {
+    // The previous run's log is kept as mkw-prev.log: a title the console ended (its "Game or App Error", no FATAL of
+    // ours) is often started again before anyone reads its log, and the new run truncated it (play test p3).
+    (void)rename(LOG, PS5_DIR "/mkw-prev.log");
     close(1);
     close(2);
     int out = open(LOG, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
