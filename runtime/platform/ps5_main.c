@@ -237,11 +237,21 @@ static void pt_watch(void *arg) {
     }
 }
 
+// The memory line every 30 s, on a thread of its own: it takes the log stream's and the heap's locks, and a thread
+// stopped holding one of them would otherwise stop the thread dump too (play test p4).
+static void mem_watch(void *arg) {
+    (void)arg;
+    for (;;) {
+        plat_sleep_ms(30000);
+        memory_report("every 30 s");
+    }
+}
+
 static void dump_watch(void *arg) {
     (void)arg;
     for (int n = 1, tick = 0;; ) {
         plat_sleep_ms(2000);
-        if (++tick % 15 == 0) memory_report("every 30 s");   // the memory budget while the game runs (Step 4)
+        (void)tick;   // the memory report has its own thread (mem_watch): it takes the log's and the heap's locks
         if (access(DUMP_TRIGGER, F_OK)) continue;
         // The trigger's text, if any: "<count> <interval_ms> <thread name>" samples that thread alone (a profile).
         char req[128] = "", name[64] = "";
@@ -423,6 +433,7 @@ int main(int argc, char **argv) {
     (void)argc;
     ps5_dump_register("main");
     plat_thread_spawn(dump_watch, NULL, "dump watch", 0);
+    plat_thread_spawn(mem_watch, NULL, "mem watch", 0);
     // The SDK's stdio.h expands getc/putc/putchar/fileno/feof inline on FreeBSD's FILE layout unless __isthreaded is
     // set, and the system libc's FILE is not that layout (title run: putchar wrote through a bad pointer). The payload
     // SDK's start code sets it (ref/PS5_PayloadSDK/crt/crt.c:65-69); the title's (PS5_Vulkan tooling/native/app_crt.cpp)
