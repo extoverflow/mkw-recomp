@@ -67,7 +67,7 @@ enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW };   // PS_NONE.. are commi
 #define WW_SC_SHIFT (2 * SUB + 2)     // ww[]: bits 10-15, resets in a row that found it written; when hot, its age
 #define WW_SC_MASK (63u << WW_SC_SHIFT)
 #define WW_HOT_AFTER 3
-#define WW_HOT_AGE 256
+#define WW_HOT_AGE 32
 
 typedef struct {
     uint8_t state[CHUNK / PG];       // per 4 KiB page
