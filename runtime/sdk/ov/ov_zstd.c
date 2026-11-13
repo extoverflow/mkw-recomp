@@ -17,6 +17,7 @@
 
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
+#include <zstd_errors.h>   // ZSTD_getErrorCode: zstd.h does not include it
 
 #include "cfg.h"
 #include "hacks.h"
