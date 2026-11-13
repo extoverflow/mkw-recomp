@@ -1,5 +1,5 @@
 """Build the game: compile the generated C (from recomp/gen.py) and the runtime, link build/mkw (or
-build/mkw.exe with --target windows).
+build/mkw.exe with --target windows, the PS5 runtime's objects with --target ps5).
 
 Why: the generated code is ~0.9 GB of C in ~355 chunks; Ninja recompiles only what changed and runs the chunks in
 parallel. Each job can take several hundred MB, so the job count comes from a memory budget, not the core count.
@@ -20,7 +20,11 @@ platform/linux.c.
 build/mkw writes build/pgo/raw/mkw-<pid>.profraw when it exits), a .profdata file compiles it at -O2 with that profile
 (objects in build/obj-pgo). The runtime stays as it is.
 
-Usage: uv run tools/build/build.py [--target linux|windows] [--gen DIR] [--exefs DIR] [--romfs DIR]
+--target ps5 compiles the runtime for the PS5 with the payload SDK (PS5_PAYLOAD_SDK, its LLVM through LLVM_CONFIG) and
+the console's zstd, Opus and libvpx under PS5_LIBS; objects in build/obj-ps5. The SDL3 files are left out until the PS5
+has its own window, input and sound; --compile-only builds the objects and stops before linking.
+
+Usage: uv run tools/build/build.py [--target linux|windows|ps5] [--gen DIR] [--exefs DIR] [--romfs DIR]
        [--jobs N] [--frame-pointers] [--pgo gen|FILE.profdata] [--dry-run]
 Heavy (all cores, several GB): our runs go through tools/run/job.sh. --gen defaults to the dump's version
 (recomp/versions.py: build/generated, build/generated-180).
@@ -136,6 +140,24 @@ LINUX = Target(
     ["-lvulkan", "-lSDL3", "-lopus", "-lvpx", "-lzstd", "-l:libstdc++.a", "-lm", "-lpthread", "-ldl"],
     ROOT / "scratchpad/vma",  # vk_mem_alloc.h 3.4.0 (AUR only on Arch); fetched as in tools/build/README.md
 )  # fmt: skip
+PS5_SDK = Path(os.environ.get("PS5_PAYLOAD_SDK", "/nonexistent"))  # the PS5 payload SDK (PS5_Vulkan's pinned fork)
+PS5_LIBS = Path(os.environ.get("PS5_LIBS", "/nonexistent"))  # zstd, Opus, libvpx built for the PS5: include/, lib/
+PS5 = Target(
+    str(PS5_SDK / "bin/prospero-clang"), str(PS5_SDK / "bin/prospero-clang++"), str(PS5_SDK / "bin/prospero-ar"),
+    ROOT / "build/mkw.elf",
+    # -msha: clang's intrinsic headers hide SHA on the PS5 target unless the whole file has it (core/base/sha256.c)
+    # -isystem: searched after the runtime's -I list, so PS5_LIBS's own imgui.h does not shadow runtime/third_party's
+    ["-msha", f"-include{RUNTIME / 'platform/ps5_compat.h'}", f"-isystem{PS5_LIBS / 'include'}",
+     f"-isystem{ROOT / 'build/ps5-deps/include'}"],
+    [], [],
+    ROOT / "scratchpad/vma",
+)  # fmt: skip
+# The SDL3 front end (window, input, sound, start screen, menus): not on the PS5 until it has its own (runtime/...).
+PS5_WITHOUT = {"audio/audio_mixer.c", "gfx/nvn/host/gfx_window_sdl.c", "input/input.c",
+               "input/input_sdl.c", "third_party/imgui/backends/imgui_impl_sdl3.cpp",
+               "third_party/imgui/backends/imgui_impl_sdlrenderer3.cpp", "ui/launcher/launcher.cpp",
+               "ui/launcher/launcher_backdrop.cpp", "ui/launcher/launcher_setup.cpp", "ui/launcher/launcher_update.cpp",
+               "ui/menu/menu_sdl.cpp"}  # fmt: skip
 WINDOWS = Target(
     str(WIN / "llvm-mingw/bin/x86_64-w64-mingw32-clang"), str(WIN / "llvm-mingw/bin/x86_64-w64-mingw32-clang++"),
     str(WIN / "llvm-mingw/bin/llvm-ar"), ROOT / "build/mkw.exe",
@@ -178,8 +200,13 @@ def mem_total_gb() -> float:
 
 def runtime_sources(target: Target) -> list[Path]:
     """Every runtime .c/.cpp of the target. Linux: no Win32 file (*_win.*, platform/win32*.c). Windows: no
-    platform/linux*.c."""
+    platform/linux*.c. Neither: platform/ps5*.c. PS5: no Linux or Windows file, and not the SDL3 front end
+    (PS5_WITHOUT; platform/ps5_frontend.c stands in for it)."""
     srcs = [*RUNTIME.rglob("*.c"), *RUNTIME.rglob("*.cpp")]
+    if target is PS5:
+        return sorted(p for p in srcs if not p.stem.endswith("_win") and not p.stem.startswith(("win32", "linux"))
+                      and str(p.relative_to(RUNTIME)) not in PS5_WITHOUT)  # fmt: skip
+    srcs = [p for p in srcs if not p.stem.startswith("ps5")]
     if target is LINUX:
         return sorted(p for p in srcs if not p.stem.endswith("_win") and not p.stem.startswith("win32"))
     return sorted(p for p in srcs if not p.stem.startswith("linux"))
@@ -322,7 +349,8 @@ def ninja_file(target: Target, gen: Path | None, out: Path, rt_extra: list[str],
     link_flags = list(target.link_flags) + (ld_extra or [])
     if dist and target is LINUX:
         link_flags += [f"-Wl,--export-dynamic-symbol={s}" for s in RT_EXPORTS]
-    elif dist:  # the exports (a .def file lld reads as an input) and the import library the game code links against
+    elif dist and target is WINDOWS:
+        # the exports (a .def file lld reads as an input) and the import library the game code links against
         out.mkdir(parents=True, exist_ok=True)
         (out / "mkw.def").write_text("EXPORTS\n" + "".join(f"    {s}\n" for s in RT_EXPORTS))
         # GUI subsystem: started from Explorer or a shortcut, no console window opens (main() stays the entry)
@@ -381,7 +409,7 @@ def ninja_file(target: Target, gen: Path | None, out: Path, rt_extra: list[str],
         lib = out / f"lib{mod}.a"
         libs.append(str(lib))
         lines.append(f"build {lib}: ar {' '.join(objs)}")
-    rt_objs = []
+    rt_objs: list[str] = []
     rt_srcs = [*runtime_sources(target), out / "rt/defaults.c", *sorted((out / "rt/i18n").glob("ui_text_*.c"))]
     rt_srcs.append(out / "rt/app_icon.c")   # the window's icon, drawn by tools/build/icon.py (never committed)
     lines.append(f"build {out / 'rt/app_icon.c'}: icon {ROOT / 'tools/build/icon.py'}")
@@ -391,6 +419,7 @@ def ninja_file(target: Target, gen: Path | None, out: Path, rt_extra: list[str],
         obj = out / "rt" / rel.with_suffix(".o")
         rt_objs.append(str(obj))
         lines.append(f"build {obj}: {'rtcxx' if src.suffix == '.cpp' else 'rtcc'} {src}")
+    lines.append(f"build objects: phony {' '.join(rt_objs + libs)}")  # --compile-only
     if target.windres:  # windres writes no depfile: the manifest and the icon it embeds are listed by hand
         rc = RUNTIME / "platform/mkw.rc"
         ico = out / "rt/platform/mkw.ico"  # drawn by tools/build/icon.py, never committed
@@ -448,7 +477,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--gen", type=Path, default=None,
                     help="generated C dir (default: the dump's version: build/generated, build/generated-180)")
-    ap.add_argument("--target", choices=("linux", "windows"), default="linux")
+    ap.add_argument("--target", choices=("linux", "windows", "ps5"), default="linux")
     ap.add_argument("--arch", choices=tuple(ARCH_FLAGS), default=ARCH, help="Linux: the CPU (default: this machine's)")
     ap.add_argument("--cpu", choices=("v3", "noavx2"), default="v3",
                     help="x86-64: v3 (AVX2, the default) or noavx2 (x86-64-v2: the package for CPUs without AVX2, #82)")  # fmt: skip
@@ -475,6 +504,7 @@ def main() -> None:
                     help="optimization level of the generated C (a measurement; with its own --out: the default "
                          "objects stay for the next default build)")  # fmt: skip
     ap.add_argument("--dry-run", action="store_true", help="write build.ninja and show what would run")
+    ap.add_argument("--compile-only", action="store_true", help="the objects only, no link (the PS5 target for now)")
     ap.add_argument(
         "--frame-pointers",
         action="store_true",
@@ -497,7 +527,12 @@ def main() -> None:
         ap.error("--runtime-only needs --dist")
     if HOST_WINDOWS and args.target != "windows":
         ap.error("on Windows only --target windows builds (mkw.exe)")
-    target = WINDOWS if args.target == "windows" else LINUX
+    target = WINDOWS if args.target == "windows" else PS5 if args.target == "ps5" else LINUX
+    if target is PS5:
+        for name, path in (("PS5_PAYLOAD_SDK", PS5_SDK / "bin/prospero-clang"), ("PS5_LIBS", PS5_LIBS / "include"),
+                           ("LLVM_CONFIG", Path(os.environ.get("LLVM_CONFIG", "/nonexistent")))):  # fmt: skip
+            if not path.exists():
+                sys.exit(f"--target ps5: {name} must point to it ({path} is missing; tools/build/README.md)")
     if args.arch != "x86_64" and target is WINDOWS:
         ap.error("--target windows is x86_64 only")
     if args.cpu == "noavx2" and args.arch != "x86_64":
@@ -506,7 +541,7 @@ def main() -> None:
     pgo_ld = pgo_flags(args.pgo, target) if args.pgo else []
     if args.pgo and not args.out:  # its own objects: the plain -O1 ones stay for the next plain build
         args.out = ROOT / ("build/obj-pgogen" if args.pgo == "gen" else "build/obj-pgo")
-    if args.sysroot and target is WINDOWS:
+    if args.sysroot and target is not LINUX:
         ap.error("--sysroot is for Linux")
     # zstd and xxhash.h of the sysroot sit in its usr/local (tools/build/sysroot.py), whose include clang already reads
     sys_flags = [f"--target={ARCH}-linux-gnu", f"--sysroot={args.sysroot.resolve()}"] if args.sysroot else []
@@ -515,7 +550,8 @@ def main() -> None:
     cross = ARCH != HOST_ARCH and target is LINUX  # another CPU's build: its own dist and object folders
     nov = "-noavx2" if args.cpu == "noavx2" else ""
     dist = ROOT / "build/dist" / (args.target + (f"-{ARCH}" if cross else "") + nov) if args.dist else None
-    args.out = args.out or ROOT / ("build/obj" + ("-dist" if dist else "") + ("-win" if target is WINDOWS else "")
+    suffix = "-win" if target is WINDOWS else "-ps5" if target is PS5 else ""
+    args.out = args.out or ROOT / ("build/obj" + ("-dist" if dist and target is not PS5 else "") + suffix
                                    + (f"-{ARCH}" if cross else "") + nov)  # fmt: skip
     if HOST_WINDOWS and not shutil.which("ninja") and (MSYS2_UCRT64_BIN / "ninja.exe").is_file():
         # at the end, as windeps.py does: what PATH already has stays first
@@ -554,6 +590,7 @@ def main() -> None:
     if target is LINUX and not dist:
         write_compile_db(args.out / "build.ninja")
     cmd = ["ninja", "-f", str(args.out / "build.ninja"), "-j", str(jobs)] + (["-n"] if args.dry_run else [])
+    cmd += ["objects"] if args.compile_only else []
     print(f"{' '.join(cmd)}  ({jobs} jobs)")
     sys.exit(subprocess.run(cmd, check=False).returncode)
 
