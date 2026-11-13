@@ -195,13 +195,24 @@ static void dump_watch(void *arg) {
         plat_sleep_ms(2000);
         if (++tick % 30 == 0) memory_report("every 60 s");   // the memory budget while the game runs (Step 4)
         if (access(DUMP_TRIGGER, F_OK)) continue;
+        // The trigger's text, if any: "<count> <interval_ms> <thread name>" samples that thread alone (a profile).
+        char req[128] = "", name[64] = "";
+        int count = 0, every = 0, tf = open(DUMP_TRIGGER, O_RDONLY);
+        if (tf >= 0) {
+            ssize_t r = read(tf, req, sizeof req - 1);
+            req[r > 0 ? r : 0] = 0;
+            close(tf);
+        }
         unlink(DUMP_TRIGGER);
+        if (sscanf(req, "%d %d %63[^\n]", &count, &every, name) != 3 || count <= 0 || every <= 0) count = 0;
         int fd = open(DUMP_OUT, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd < 0) continue;
-        char head[96];
-        int k = snprintf(head, sizeof head, "== dump %d at %.3f s\n", n++, plat_process_uptime_ns() / 1e9);
+        char head[160];
+        int k = snprintf(head, sizeof head, "== dump %d at %.3f s%s%s\n", n++, plat_process_uptime_ns() / 1e9,
+                         count ? ": sampling " : "", count ? name : "");
         (void)!write(fd, head, (size_t)k);
-        ps5_dump_threads(fd);
+        if (count) ps5_dump_sample(fd, name, count, every);
+        else ps5_dump_threads(fd);
         close(fd);
     }
 }
