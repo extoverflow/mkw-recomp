@@ -160,6 +160,11 @@ int probe_window(void) {
     }
     printf("probe-window: focus off/on pushed 2 messages (15)\n");
 
+#ifdef __PROSPERO__
+    // A console has no cursor, no keyboard and one display whose mode the title does not change (platform/ps5_window.c):
+    // the cursor release and the resize below are a desktop window's.
+    printf("probe-window: cursor release and resize skipped (PS5: no cursor, the display keeps its mode)\n");
+#else
     // Cursor release: Esc releases, a client click recaptures, a title bar activation releases (where the window system
     // reports one). The probe window may not be the foreground window, so this checks the release flag, not the capture.
     wsys_probe_escape();
@@ -190,6 +195,7 @@ int probe_window(void) {
         return fail("swapchain size after resize");
     }
     printf("probe-window: resized to %dx%d, presents still exact\n", w, h);
+#endif
     vk_present_capture(0);
 
     // Vsync: count ticks between two tick edges about 5 s apart.
