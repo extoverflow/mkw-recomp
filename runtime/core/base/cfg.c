@@ -317,6 +317,9 @@ static const struct { const char *key, *value; } DECK[] = {
 static const struct { const char *key, *value; } PS5[] = {
     {"MESH_COMPUTE", "1"}, {"PIPE_WORKERS", "4"}, {"SPARSE_IMAGES", "0"}, {"TEX_MAX", "1024"}, {"GPL", "0"},
     {"PIPE_SKIP", "strict"},
+    // Screen-space passes at the output's 1080 lines instead of 2560x1440, the 3D scene at the game's own (65 % of
+    // 1440): a race's render targets took 1,508 MiB of the 4 GiB and its textures failed (black race, run 38).
+    {"RESOLUTION", "1080"}, {"RESOLUTION_3D", "original"},
 };
 static int profile = -1;   // 0 none, 1 Steam Deck, 2 PS5
 
