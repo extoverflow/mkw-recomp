@@ -191,20 +191,35 @@ static void unback(uint64_t k) {
     c->ww[i] &= (uint16_t)~WW_ALL;   // its pages read zero again: nothing written (as Linux, unpopulated pages)
 }
 
+// Whether no 4 KiB page of [a, a + n) is ours: a GiB without a chunk is all free.
+static int range_free(uint64_t a, uint64_t n) {
+    for (uint64_t end = a + n; a < end;) {
+        uint64_t stop = (a / CHUNK + 1) * CHUNK < end ? (a / CHUNK + 1) * CHUNK : end;
+        Chunk *c = chunk_of(a, 0);
+        if (c)
+            for (uint64_t i = (a % CHUNK) / PG, e = i + (stop - a + PG - 1) / PG; i < e; i++)
+                if (c->state[i] != PS_FREE) return 0;
+        a = stop;
+    }
+    return 1;
+}
+
+static int kpage_ours(uint64_t k) { return !range_free(k, KP); }
+
+// The range must be free; only its first and last kernel pages can be shared with a neighbouring reservation (already
+// reserved then), so everything between is reserved with one call (a 16 KiB page at a time took 15 s for the guest's
+// 64 GiB alias region and the rest at the game's start, 13/11/2026).
 int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
     if (!n || addr + n > PS_LIMIT) return 0;
     plat_mutex_lock(&vm_lock);
-    int ok = 1;
-    for (uint64_t a = addr; a < addr + n && ok; a += PG) ok = st_get(a) == PS_FREE;
-    // The kernel's pages the range touches that nothing of ours holds yet: reserved there exactly, or refused.
-    uint64_t lo = addr & ~(KP - 1), hi = (addr + n + KP - 1) & ~(KP - 1), done = lo;
-    for (uint64_t k = lo; k < hi && ok; k += KP) {
-        int ours = 0;
-        for (uint64_t i = 0; i < SUB; i++) ours |= st_get(k + i * PG) != PS_FREE;
-        if (ours) continue;
-        void *at = (void *)(uintptr_t)k;
-        if (sceKernelReserveVirtualRange(&at, KP, MAP_FIXED | NO_REPLACE, KP) || at != (void *)(uintptr_t)k) ok = 0;
-        else done = k + KP;
+    int ok = range_free(addr, n);
+    uint64_t lo = addr & ~(KP - 1), hi = (addr + n + KP - 1) & ~(KP - 1), start = lo, end = hi;
+    if (ok && kpage_ours(lo)) start += KP;
+    if (ok && end > start && kpage_ours(hi - KP)) end -= KP;
+    if (ok && start < end) {   // reserved there exactly, or refused
+        void *at = (void *)(uintptr_t)start;
+        if (sceKernelReserveVirtualRange(&at, end - start, MAP_FIXED | NO_REPLACE, KP) || at != (void *)(uintptr_t)start)
+            ok = 0;
     }
     if (ok) {
         st_set(addr, n, PS_RESERVED);
@@ -212,12 +227,7 @@ int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
             uint16_t *w = ww_of(k);
             if (w) *w = WW_ON;
         }
-    } else
-        for (uint64_t k = lo; k < done; k += KP) {   // undo ours
-            int ours = 0;
-            for (uint64_t i = 0; i < SUB; i++) ours |= st_get(k + i * PG) != PS_FREE;
-            if (!ours) munmap((void *)(uintptr_t)k, KP);
-        }
+    }
     plat_mutex_unlock(&vm_lock);
     return ok;
 }
