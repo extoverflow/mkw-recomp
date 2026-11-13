@@ -9,6 +9,8 @@
 #include "gfx_wsys.h"
 #include "input.h"
 #include "input_wsys.h"
+#include "switch2.h"
+#include "cfg.h"
 #include "launcher.h"
 
 // ---- keyboard and mouse (input_wsys.h; input_sdl.c on Linux): none on a console. input.c is built, on
@@ -23,6 +25,12 @@ int ikb_captured(void) { return 0; }
 void ikb_mouse_take(int32_t *dx, int32_t *dy) { *dx = *dy = 0; }
 void ikb_cursor_update(void) {}
 void ikb_menu_closed(void) {}
+// Switch 2 controllers over Bluetooth LE (input/switch2.c, with linux_switch2.c's or switch2_win.c's transport): no
+// transport on the console, so MKW_SWITCH2 has no effect here; the controllers the console pairs come as its own pads.
+void switch2_start(void) {
+    if (cfg_int("MKW_SWITCH2")) rt_log("input: Switch 2 controllers over Bluetooth are not available on the PS5");
+}
+
 // input.h's keyboard queries that input_sdl.c answers on Linux: no key is ever down
 uint32_t input_key_char(int key) {
     (void)key;
