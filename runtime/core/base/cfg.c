@@ -525,8 +525,8 @@ static const struct { const char *key, *value; } DECK[] = {
 // Turnip: vk_tex_image.c); fast-linked library pipelines drew without a vertex stage (radv_get_vgt_shader_key read
 // 0x199: GPL); with GPL off, builds are slow enough that skipped full-screen draws left the whole 3D scene black for a
 // frame, 4 times in 15.7 s at the menu, none in 40 s with PIPE_SKIP=strict (recordings v01/v02). GPU_MEM_LIMIT stays
-// the integrated-GPU default (4096): 6144 let the pool's largest free block fall to 3.7 MiB at 300 s and the console
-// went down (run 28).
+// the integrated-GPU default (4096): 6144 let the pool's largest free block fall to 3.7 MiB at 300 s (run 28:
+// the game went on, slow and glitchy).
 static const struct { const char *key, *value; } PS5[] = {
     {"MESH_COMPUTE", "1"}, {"PIPE_WORKERS", "4"}, {"SPARSE_IMAGES", "0"}, {"TEX_MAX", "1024"}, {"GPL", "0"},
     {"PIPE_SKIP", "strict"},
