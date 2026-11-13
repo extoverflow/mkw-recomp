@@ -77,7 +77,7 @@ static int log_open(void) {
         (void)!freopen(LOG, "a", stdout);
         (void)!freopen(LOG, "a", stderr);
     }
-    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);   // line-buffered on the PS5 (ps5_compat.h: ps5_setvbuf)
     setvbuf(stderr, NULL, _IONBF, 0);
     return ok;
 }

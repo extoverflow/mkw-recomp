@@ -19,4 +19,9 @@ int pthread_getname_np(struct pthread *, char *, __SIZE_TYPE__);
 // RADV is linked into the title and defines Mesa's vk_sync_finish; the runtime's own (gfx/vk/device/vk_sync.c) takes
 // another name here (the only global both define, by llvm-nm over both, 13/11/2026).
 #define vk_sync_finish mkw_vk_sync_finish
+// stdout and stderr unbuffered (core/boot/main.c) cost 0.1 s per log line on the console: unbuffered stdio writes in
+// small pieces and each write to /data costs ~0.9 ms (a write test on the console, 13/11/2026: 120 bytes, 103 ms
+// unbuffered, 0.95 ms line-buffered). platform/ps5_sys.c's ps5_setvbuf gives them line buffering instead: one write per
+// line, and a crash still loses at most the line being written.
+#define setvbuf ps5_setvbuf
 #endif
