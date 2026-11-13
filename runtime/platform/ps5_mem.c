@@ -8,7 +8,12 @@
 // - the guest's state is kept per 4 KiB page (pstate, as on Linux) and applied per 16 KiB page as the strictest
 //   protection among its committed 4 KiB pages; an access that its own 4 KiB page allows but a stricter sibling
 //   blocks goes to the fault hook for that sibling (a frozen page thaws: counted as written, never missed);
-// - no write watch and no populated-page scan (UINT64_MAX: untracked, as Linux without userfaultfd).
+// - write watch in software, per 16 KiB page (Linux has the kernel's asynchronous userfaultfd, Windows GetWriteWatch,
+//   both per 4 KiB page): a watched page is writable only while all four of its 4 KiB pages count as written; the
+//   first write after a reset faults, marks all four (a superset: which of them the later writes hit is not seen) and
+//   opens the page. A query reports the marked 4 KiB pages; a reset unmarks those reported and closes the page again,
+//   so a write to any of them faults again;
+// - no populated-page scan (UINT64_MAX: as Windows).
 // Code map and divergences: kept outside this repo.
 #include <dlfcn.h>
 #include <errno.h>
@@ -42,8 +47,13 @@ int32_t sceKernelReserveVirtualRange(void **addr, size_t len, int flags, size_t 
 #define BLOCK (2ull << 20)           // backed at once where a whole aligned block is committed read-write
 enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW };   // PS_NONE.. are committed: PLAT_PROT_* + PS_NONE
 
+#define WW_ALL ((1u << SUB) - 1)     // ww[]: bits 0-3, one per 4 KiB page written since its last reset
+#define WW_PEND_SHIFT SUB            // ww[]: bits 4-7, reported and to unmark once the page is closed (a reset)
+#define WW_ON (1u << (2 * SUB))      // ww[]: the 16 KiB page lies in a watched reservation
+
 typedef struct {
     uint8_t state[CHUNK / PG];       // per 4 KiB page
+    uint16_t ww[CHUNK / KP];         // per 16 KiB page: WW_ON, the written 4 KiB pages, those being unmarked
     uint8_t backed[CHUNK / KP / 8];  // per 16 KiB page: direct memory mapped there
     int64_t *phys;                   // per 16 KiB page: its direct memory; made on the first backing in the chunk
 } Chunk;
@@ -84,6 +94,23 @@ static int is_backed(uint64_t k) {
     return c && (c->backed[i / 8] >> (i % 8) & 1);
 }
 
+static uint16_t *ww_of(uint64_t k) {
+    Chunk *c = chunk_of(k, 0);
+    return c ? &c->ww[(k % CHUNK) / KP] : NULL;
+}
+
+// A watched 16 KiB page not wholly marked written stays closed to writes, so the next write is seen.
+static int ww_closed(uint64_t k) {
+    uint16_t *w = ww_of(k);
+    return w && (*w & WW_ON) && (*w & WW_ALL) != WW_ALL;
+}
+
+// The fault on a write to a watched page: all four marked written, the page may open (vm_lock held).
+static void ww_mark(uint64_t k) {
+    uint16_t *w = ww_of(k);
+    if (w && (*w & WW_ON)) *w |= WW_ALL;
+}
+
 static int prot_of(int ps) { return ps == PS_RW ? PROT_READ | PROT_WRITE : ps == PS_READ ? PROT_READ : PROT_NONE; }
 
 // The protection a backed 16 KiB page gets: the strictest of its committed 4 KiB pages (none committed: none).
@@ -93,7 +120,8 @@ static int kpage_prot(uint64_t k) {
         int s = st_get(k + i * PG);
         if (s >= PS_NONE && s < best) best = s;
     }
-    return best > PS_RW ? PROT_NONE : prot_of(best);
+    int prot = best > PS_RW ? PROT_NONE : prot_of(best);
+    return ww_closed(k) ? prot & ~PROT_WRITE : prot;
 }
 
 static void apply(uint64_t k) {
@@ -131,7 +159,20 @@ static int back(uint64_t k, int prot) {
     uint64_t b = k & ~(BLOCK - 1);
     int whole = b + BLOCK <= PS_LIMIT;
     for (uint64_t a = b; a < b + BLOCK && whole; a += PG) whole = st_get(a) == PS_RW && !is_backed(a & ~(KP - 1));
-    if (whole && back_run(b, BLOCK)) return 1;
+    if (whole && back_run(b, BLOCK)) {
+        // back_run leaves the block read-write: the watched pages not marked written are closed again (one call
+        // where none of the block is marked, as after a heap's commit)
+        int any_closed = 0, all_closed = 1;
+        for (uint64_t a = b; a < b + BLOCK; a += KP) {
+            int c = ww_closed(a);
+            any_closed |= c, all_closed &= c;
+        }
+        if (all_closed) mprotect((void *)(uintptr_t)b, BLOCK, PROT_READ);
+        else if (any_closed)
+            for (uint64_t a = b; a < b + BLOCK; a += KP)
+                if (ww_closed(a)) mprotect((void *)(uintptr_t)a, KP, PROT_READ);
+        return 1;
+    }
     if (!back_run(k, KP)) return 0;
     if (prot != (PROT_READ | PROT_WRITE)) mprotect((void *)(uintptr_t)k, KP, prot);
     return 1;
@@ -147,10 +188,10 @@ static void unback(uint64_t k) {
     if (c->phys && c->phys[i]) sceKernelReleaseDirectMemory(c->phys[i], KP);
     if (c->phys) c->phys[i] = 0;
     c->backed[i / 8] &= (uint8_t)~(1u << (i % 8));
+    c->ww[i] &= (uint16_t)~WW_ALL;   // its pages read zero again: nothing written (as Linux, unpopulated pages)
 }
 
 int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
-    (void)watch;   // no write watch on the console
     if (!n || addr + n > PS_LIMIT) return 0;
     plat_mutex_lock(&vm_lock);
     int ok = 1;
@@ -165,8 +206,13 @@ int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
         if (sceKernelReserveVirtualRange(&at, KP, MAP_FIXED | NO_REPLACE, KP) || at != (void *)(uintptr_t)k) ok = 0;
         else done = k + KP;
     }
-    if (ok) st_set(addr, n, PS_RESERVED);
-    else
+    if (ok) {
+        st_set(addr, n, PS_RESERVED);
+        for (uint64_t k = lo; k < hi && watch; k += KP) {
+            uint16_t *w = ww_of(k);
+            if (w) *w = WW_ON;
+        }
+    } else
         for (uint64_t k = lo; k < done; k += KP) {   // undo ours
             int ours = 0;
             for (uint64_t i = 0; i < SUB; i++) ours |= st_get(k + i * PG) != PS_FREE;
@@ -244,6 +290,7 @@ static int through(uint64_t addr, void *buf, size_t n, int write) {
             mprotect((void *)(uintptr_t)k, KP, PROT_READ | PROT_WRITE);
         if (write) memcpy((void *)(uintptr_t)addr, buf, n);
         else memcpy(buf, (const void *)(uintptr_t)addr, n);
+        for (uint64_t k = addr & ~(KP - 1); k < addr + n && write; k += KP) ww_mark(k);
         for (uint64_t k = addr & ~(KP - 1); k < addr + n; k += KP) apply(k);
     }
     plat_mutex_unlock(&vm_lock);
@@ -265,9 +312,58 @@ int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end) {
     return v == PS_FREE ? PLAT_MEM_FREE : v == PS_RESERVED ? PLAT_MEM_RESERVED : v - PS_NONE;
 }
 
+// Closes [run, run_end) to writes, then unmarks what plat_mem_written reported there (the pending bits).
+static void ww_close_run(uint64_t run, uint64_t run_end, int prot) {
+    if (run_end <= run) return;
+    mprotect((void *)(uintptr_t)run, run_end - run, prot);
+    for (uint64_t k = run; k < run_end; k += KP) {
+        uint16_t *w = ww_of(k);
+        if (w) *w = (uint16_t)(*w & (WW_ON | WW_ALL) & ~(*w >> WW_PEND_SHIFT & WW_ALL));
+    }
+}
+
+// The committed 4 KiB pages marked written, in address order. reset: those reported are unmarked, and their 16 KiB
+// pages closed to writes again. A range that is not wholly watched is untracked.
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
-    (void)addr, (void)n, (void)pages, (void)reset;
-    return max ? UINT64_MAX : 0;   // not tracked: no userfaultfd or PAGEMAP_SCAN
+    if (!max || !n) return 0;
+    if (addr + n > PS_LIMIT) return UINT64_MAX;
+    uint64_t got = 0, end = addr + n, run = 0, run_end = 0;
+    int run_prot = 0;
+    for (uint64_t k = addr & ~(KP - 1); k < end; k += KP) {   // watched throughout, or untracked (set at reservation)
+        uint16_t *w = ww_of(k);
+        if (!w || !(*w & WW_ON)) return UINT64_MAX;
+    }
+    plat_mutex_lock(&vm_lock);
+    for (uint64_t k = addr & ~(KP - 1); k < end && got < max; k += KP) {
+        uint16_t *w = ww_of(k);
+        if (!(*w & WW_ALL)) continue;
+        uint8_t cleared = 0;
+        for (uint64_t i = 0; i < SUB && got < max; i++) {
+            uint64_t p = k + i * PG;
+            if (p < addr || p >= end || !(*w >> i & 1) || st_get(p) < PS_NONE) continue;
+            pages[got++] = p;
+            cleared |= (uint8_t)(1u << i);
+        }
+        if (!reset || !cleared) continue;
+        // Closed first, unmarked after: a write that lands before the close was reported now; one after it faults
+        // and waits for vm_lock in ps5_fault, then marks the page again. Open pages are closed in runs of the same
+        // protection (an mprotect costs about 36 us per call on the console, mem_test 13/11/2026), so the marks of a
+        // run are cleared when the run is closed.
+        int prot = kpage_prot(k) & ~PROT_WRITE;
+        if ((*w & WW_ALL) == WW_ALL && is_backed(k)) {
+            if (run_end != k || run_prot != prot) {
+                ww_close_run(run, run_end, run_prot);
+                run = k, run_prot = prot;
+            }
+            run_end = k + KP;
+            *w |= (uint16_t)(cleared << WW_PEND_SHIFT);   // unmarked once the run is closed
+            continue;
+        }
+        *w &= (uint16_t)~cleared;
+    }
+    ww_close_run(run, run_end, run_prot);
+    plat_mutex_unlock(&vm_lock);
+    return got;
 }
 
 uint64_t plat_mem_populated(uint64_t addr, uint64_t n, uint64_t (*runs)[2], uint64_t max) {
@@ -318,10 +414,15 @@ static int ps5_fault(uint64_t a, int write) {
         if (ps >= PS_NONE && ps < need && fault_hook) fault_hook(p);
     }
     plat_mutex_lock(&vm_lock);
+    // A write to a watched page: all four of its 4 KiB pages marked written (the first write since the last reset
+    // faulted here), under the same lock as the opening below, so a reset cannot come between them.
+    if (write) ww_mark(k);
     int now = kpage_prot(k), allowed = write ? (now & PROT_WRITE) != 0 : (now & PROT_READ) != 0;
     if (!allowed) {   // a sibling stays stricter: the page opens for this access anyway (counted)
         mprotect((void *)(uintptr_t)k, KP, write ? PROT_READ | PROT_WRITE : PROT_READ);
         sibling_lifts++;
+    } else {
+        apply(k);   // the protection the state gives now (the write mark above opens a watched page)
     }
     plat_mutex_unlock(&vm_lock);
     return 1;

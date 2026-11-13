@@ -37,6 +37,16 @@ _Static_assert(sizeof(NVNtextureView) == 16, "NVNtextureView is 16 bytes in TotK
 _Static_assert(offsetof(cmd_t, inline_cur) == 0x20 && offsetof(cmd_t, inline_end) == 0x28, "cmd_t inline fields");
 _Static_assert(RT_GPU_VA_BASE >= RT_ADDRESS_LIMIT, "GPU address window overlaps the guest address space");
 
+// The pages write watch reports for one write: the 4 KiB page on Linux and Windows; on the PS5 the four 4 KiB pages of
+// the 16 KiB kernel page (platform/ps5_mem.c tracks writes per kernel page and reports a superset).
+#ifdef __PROSPERO__
+#define WW_GRAIN 0x4000ull
+#else
+#define WW_GRAIN 0x1000ull
+#endif
+#define WW_PAGES (WW_GRAIN / 0x1000)
+#define WW_FIRST(a) ((a) & ~(WW_GRAIN - 1))
+
 // Write watch: a committed heap page and an alias page, written once, are reported once.
 static void check_write_watch(void) {
     const RtGuestLayout *g = mem_layout();
@@ -46,8 +56,8 @@ static void check_write_watch(void) {
     volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)heap;
     p[0x5000] = 1;
     n = mem_written_pages(heap, 0x200000, pages, 8);
-    CHECK(n == 1 && pages[0] == heap + 0x5000, "heap write: %llu pages reported (want 1 at %#llx)",
-          (unsigned long long)n, (unsigned long long)(heap + 0x5000));
+    CHECK(n == WW_PAGES && pages[0] == WW_FIRST(heap + 0x5000), "heap write: %llu pages reported (want %llu at %#llx)",
+          (unsigned long long)n, (unsigned long long)WW_PAGES, (unsigned long long)WW_FIRST(heap + 0x5000));
     printf("write-watch: heap page written once: %llu reported at +%#llx\n", (unsigned long long)n,
            n ? (unsigned long long)(pages[0] - heap) : 0ull);
     n = mem_written_pages(heap, 0x200000, pages, 8);
@@ -59,7 +69,12 @@ static void check_write_watch(void) {
     n = mem_written_pages(heap, 0x200000, pages, 2);
     uint64_t m = mem_written_pages(heap, 0x200000, pages + 2, 6);
     printf("write-watch: three pages written, max 2: %llu then %llu\n", (unsigned long long)n, (unsigned long long)m);
-    CHECK(n == 2 && m == 1, "max 2 reported %llu, then %llu (want 2, 1)", (unsigned long long)n, (unsigned long long)m);
+    // 0x7000, 0x9000 and 0xA000: three 4 KiB pages, or two 16 KiB pages (eight 4 KiB pages) on the PS5
+    uint64_t total = (WW_FIRST(0x7000ull) == WW_FIRST(0x9000ull) ? 1 : 2) * WW_PAGES +
+                     (WW_FIRST(0xA000ull) == WW_FIRST(0x9000ull) ? 0 : WW_PAGES);
+    uint64_t want_n = total < 2 ? total : 2, want_m = total - want_n < 6 ? total - want_n : 6;
+    CHECK(n == want_n && m == want_m, "max 2 reported %llu, then %llu (want %llu, %llu)", (unsigned long long)n,
+          (unsigned long long)m, (unsigned long long)want_n, (unsigned long long)want_m);
 
     // Frozen region: read-only until the first write thaws it (the write lands and is reported); mem_thaw (a file
     // read) thaws it and holds it thawed; SetHeapSize below decommits it.
@@ -70,7 +85,8 @@ static void check_write_watch(void) {
     p[0x3000] = 7;
     CHECK(!mem_frozen(heap) && p[0x3000] == 7, "a write into a frozen region did not thaw it");
     n = mem_written_pages(heap, 0x200000, pages, 8);
-    CHECK(n == 1 && pages[0] == heap + 0x3000, "write after a thaw: %llu pages reported (want 1)", (unsigned long long)n);
+    CHECK(n == WW_PAGES && pages[0] == WW_FIRST(heap + 0x3000), "write after a thaw: %llu pages reported (want %llu)",
+          (unsigned long long)n, (unsigned long long)WW_PAGES);
     CHECK(mem_freeze(heap) == 1, "refreeze after a write thaw");
     mem_thaw(heap + 0x6000, 0x1000);
     CHECK(!mem_frozen(heap) && mem_freeze(heap) == 0, "mem_thaw did not thaw and hold the region");
@@ -82,7 +98,8 @@ static void check_write_watch(void) {
     mem_written_pages(a, 0x4000, pages, 8);
     *(volatile uint8_t *)(uintptr_t)(a + 0x1000) = 1;
     n = mem_written_pages(a, 0x4000, pages, 8);
-    CHECK(n == 1 && pages[0] == a + 0x1000, "alias write: %llu pages reported (want 1)", (unsigned long long)n);
+    CHECK(n == WW_PAGES && pages[0] == WW_FIRST(a + 0x1000), "alias write: %llu pages reported (want %llu)",
+          (unsigned long long)n, (unsigned long long)WW_PAGES);
     CHECK(mem_written_pages(a, 0x4000, pages, 8) == 0, "alias: second call reported pages");
 
     // A region with reserved holes freezes its committed pages only, and a write thaws them without committing a hole.
