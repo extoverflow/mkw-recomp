@@ -308,11 +308,13 @@ static const struct { const char *key, *value; } DECK[] = {
 // worker under 14 GiB left draws waiting (PIPE_WORKERS); a sparse resource maps its whole span on PS5 RADV, one of the
 // title's 16,384 CPU page tables per 2 MiB, and the two terrain arrays used them all up (SPARSE_IMAGES, TEX_MAX as on
 // Turnip: vk_tex_image.c); fast-linked library pipelines drew without a vertex stage (radv_get_vgt_shader_key read
-// 0x199: GPL); the title owns its 12 GiB pool, where 4096 MiB (the integrated-GPU default) is a Linux desktop's share
-// (GPU_MEM_LIMIT).
+// 0x199: GPL); with GPL off, builds are slow enough that skipped full-screen draws left the whole 3D scene black for a
+// frame, 4 times in 15.7 s at the menu, none in 40 s with PIPE_SKIP=strict (recordings v01/v02). GPU_MEM_LIMIT stays
+// the integrated-GPU default (4096): 6144 let the pool's largest free block fall to 3.7 MiB at 300 s and the console
+// went down (run 28).
 static const struct { const char *key, *value; } PS5[] = {
     {"MESH_COMPUTE", "1"}, {"PIPE_WORKERS", "4"}, {"SPARSE_IMAGES", "0"}, {"TEX_MAX", "1024"}, {"GPL", "0"},
-    {"GPU_MEM_LIMIT", "6144"},
+    {"PIPE_SKIP", "strict"},
 };
 static int profile = -1;   // 0 none, 1 Steam Deck, 2 PS5
 
