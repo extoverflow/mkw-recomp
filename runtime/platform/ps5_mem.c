@@ -35,6 +35,14 @@ int32_t sceKernelAllocateDirectMemory(int64_t start, int64_t end, size_t len, si
 int32_t sceKernelReleaseDirectMemory(int64_t start, size_t len);
 int32_t sceKernelMapDirectMemory(void **addr, size_t len, int prot, int flags, int64_t phys, size_t align);
 int32_t sceKernelReserveVirtualRange(void **addr, size_t len, int flags, size_t align);
+int sceKernelVirtualQuery(const void *addr, int flags, void *info, size_t size);
+// The process's CPU and GPU page tables, in use and free (libkernel; read the same way in EglantinePS5
+// src/host_memory.cpp:509-516). A 16 KiB mapping in a 2 MiB stretch with none needs one: the console's cap on them
+// (--ps5-map-test (3), 13/11/2026) is what guest backing ran into.
+int sceKernelGetPageTableStats(int *cpu_total, int *cpu_free, int *gpu_total, int *gpu_free);
+// sceKernelVirtualQuery's entry, as PS5_Vulkan's tooling reads it (tooling/gpu-broker/client.c:54).
+typedef struct { void *start, *end; uint64_t offset; int32_t protection, type; uint8_t flags; char name[32];
+                 uint8_t padding[7]; } VqEntry;
 
 #define PG 0x1000ull                 // the guest's page
 #define KP 0x4000ull                 // the kernel's page (Gate 0)
@@ -124,23 +132,61 @@ static int kpage_prot(uint64_t k) {
     return ww_closed(k) ? prot & ~PROT_WRITE : prot;
 }
 
+// Counters for the title's memory line (ps5_mem_stats): what the faults, the backing and the protection changes cost.
+static uint64_t st_kprot_n, st_kprot_ns, st_back_n, st_back_bytes, st_back_ns, st_fault_n, st_fault_ns;
+static uint64_t st_fault_touch, st_fault_ww, st_fault_other, st_lockwait_ns, st_ww_n, st_ww_bytes, st_ww_ns;
+static uint64_t st_block_fail, st_page_fail, st_hook_after_fail, st_unback_n, st_unback_fail, st_release_fail;
+static volatile int st_unback_r, st_release_r;
+static volatile uint64_t st_fail_k, st_fail_n, st_fail_state;   // the last failed backing (diagnosis)
+static volatile int st_fail_ra, st_fail_rm, st_fail_vq = -1;
+static VqEntry st_fail_entry;   // what the kernel has at the last failed page (diagnosis)
+// Distinct 2 MiB stretches of the guest's addresses that ever had a 16 KiB backing (each needs a page-table page; the
+// console allows a process ~16k of them: --ps5-map-test (3), 13/11/2026), and those backed as whole blocks.
+static uint8_t st_region_bits[PS_LIMIT / BLOCK / 8];
+static uint64_t st_regions, st_region_blocks;
+static inline void st_add(uint64_t *v, uint64_t d) { __atomic_fetch_add(v, d, __ATOMIC_RELAXED); }
+
+static int kprot(void *a, size_t n, int prot) {   // mprotect, counted
+    uint64_t t0 = plat_now_ns();
+    int r = mprotect(a, n, prot);
+    st_add(&st_kprot_n, 1), st_add(&st_kprot_ns, plat_now_ns() - t0);
+    return r;
+}
+
 static void apply(uint64_t k) {
-    if (is_backed(k)) mprotect((void *)(uintptr_t)k, KP, kpage_prot(k));
+    if (is_backed(k)) kprot((void *)(uintptr_t)k, KP, kpage_prot(k));
 }
 
 // Maps zeroed direct memory over [k, k + n) (reserved kernel pages, none backed), one allocation; the pages are left
 // read-write. 0 when memory is gone.
 static int back_run(uint64_t k, uint64_t n) {
+    uint64_t t0 = plat_now_ns();
+    st_add(&st_back_n, 1), st_add(&st_back_bytes, n);
     int64_t phys = 0;
     void *at = (void *)(uintptr_t)k;
     size_t align = n >= BLOCK ? BLOCK : KP;
-    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), n, align, DMEM_TYPE, &phys)) return 0;
-    if (sceKernelMapDirectMemory(&at, n, PROT_READ | PROT_WRITE, MAP_FIXED, phys, align) ||
-        at != (void *)(uintptr_t)k) {
-        sceKernelReleaseDirectMemory(phys, n);
+    int ra = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), n, align, DMEM_TYPE, &phys), rm = 0;
+    if (!ra) rm = sceKernelMapDirectMemory(&at, n, PROT_READ | PROT_WRITE, MAP_FIXED, phys, align);
+    if (ra || rm || at != (void *)(uintptr_t)k) {
+        st_add(n >= BLOCK ? &st_block_fail : &st_page_fail, 1);
+        if (n < BLOCK) {   // the last failed page, for the memory line (no output from a signal handler)
+            st_fail_k = k, st_fail_n = n, st_fail_ra = ra, st_fail_rm = rm;
+            VqEntry e = {0};
+            st_fail_vq = sceKernelVirtualQuery((void *)(uintptr_t)k, 0, &e, sizeof e);
+            st_fail_entry = e;
+            st_fail_state = (uint64_t)st_get(k) | (uint64_t)st_get(k + PG) << 8 | (uint64_t)st_get(k + 2 * PG) << 16 |
+                            (uint64_t)st_get(k + 3 * PG) << 24 | (uint64_t)(at != (void *)(uintptr_t)k) << 32;
+        }
+        if (!ra) sceKernelReleaseDirectMemory(phys, n);
         return 0;
     }
     memset(at, 0, n);   // direct memory is not cleared for us
+    st_add(&st_back_ns, plat_now_ns() - t0);
+    if (k < PS_LIMIT) {
+        uint64_t r = k / BLOCK;
+        if (n >= BLOCK) st_add(&st_region_blocks, 1);
+        else if (!(st_region_bits[r / 8] >> (r % 8) & 1)) st_region_bits[r / 8] |= (uint8_t)(1u << (r % 8)), st_add(&st_regions, 1);
+    }
     for (uint64_t o = 0; o < n; o += KP) {
         Chunk *c = chunk_of(k + o, 1);
         if (!c) continue;
@@ -167,14 +213,14 @@ static int back(uint64_t k, int prot) {
             int c = ww_closed(a);
             any_closed |= c, all_closed &= c;
         }
-        if (all_closed) mprotect((void *)(uintptr_t)b, BLOCK, PROT_READ);
+        if (all_closed) kprot((void *)(uintptr_t)b, BLOCK, PROT_READ);
         else if (any_closed)
             for (uint64_t a = b; a < b + BLOCK; a += KP)
-                if (ww_closed(a)) mprotect((void *)(uintptr_t)a, KP, PROT_READ);
+                if (ww_closed(a)) kprot((void *)(uintptr_t)a, KP, PROT_READ);
         return 1;
     }
     if (!back_run(k, KP)) return 0;
-    if (prot != (PROT_READ | PROT_WRITE)) mprotect((void *)(uintptr_t)k, KP, prot);
+    if (prot != (PROT_READ | PROT_WRITE)) kprot((void *)(uintptr_t)k, KP, prot);
     return 1;
 }
 
@@ -184,8 +230,13 @@ static void unback(uint64_t k) {
     size_t i = (k % CHUNK) / KP;
     if (!c || !(c->backed[i / 8] >> (i % 8) & 1)) return;
     void *at = (void *)(uintptr_t)k;
-    sceKernelReserveVirtualRange(&at, KP, MAP_FIXED, KP);
-    if (c->phys && c->phys[i]) sceKernelReleaseDirectMemory(c->phys[i], KP);
+    st_add(&st_unback_n, 1);
+    int rr = sceKernelReserveVirtualRange(&at, KP, MAP_FIXED, KP);
+    if (rr || at != (void *)(uintptr_t)k) st_add(&st_unback_fail, 1), st_unback_r = rr;
+    if (c->phys && c->phys[i]) {
+        int rl = sceKernelReleaseDirectMemory(c->phys[i], KP);
+        if (rl) st_add(&st_release_fail, 1), st_release_r = rl;
+    }
     if (c->phys) c->phys[i] = 0;
     c->backed[i / 8] &= (uint8_t)~(1u << (i % 8));
     c->ww[i] &= (uint16_t)~WW_ALL;   // its pages read zero again: nothing written (as Linux, unpopulated pages)
@@ -209,8 +260,20 @@ static int kpage_ours(uint64_t k) { return !range_free(k, KP); }
 // The range must be free; only its first and last kernel pages can be shared with a neighbouring reservation (already
 // reserved then), so everything between is reserved with one call (a 16 KiB page at a time took 15 s for the guest's
 // 64 GiB alias region and the rest at the game's start, 13/11/2026).
+// MKW_PS5_WRITE_WATCH=0 (args.txt): no write watch, the ranges untracked (UINT64_MAX), as Linux without userfaultfd:
+// the back end then uploads them in full. To compare against the software write watch's faults (Step 4, run 15).
+static int ww_wanted(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("MKW_PS5_WRITE_WATCH");
+        on = !(e && !strcmp(e, "0"));
+    }
+    return on;
+}
+
 int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
     if (!n || addr + n > PS_LIMIT) return 0;
+    watch = watch && ww_wanted();
     plat_mutex_lock(&vm_lock);
     int ok = range_free(addr, n);
     uint64_t lo = addr & ~(KP - 1), hi = (addr + n + KP - 1) & ~(KP - 1), start = lo, end = hi;
@@ -264,7 +327,7 @@ int plat_mem_decommit(uint64_t addr, uint64_t n) {
             continue;
         }
         // Some of the 16 KiB page stays committed: the decommitted 4 KiB pages are zeroed in place.
-        mprotect((void *)(uintptr_t)k, KP, PROT_READ | PROT_WRITE);
+        kprot((void *)(uintptr_t)k, KP, PROT_READ | PROT_WRITE);
         for (uint64_t i = 0; i < SUB; i++) {
             uint64_t p = k + i * PG;
             if (p >= addr && p < addr + n) memset((void *)(uintptr_t)p, 0, PG);
@@ -297,7 +360,7 @@ static int through(uint64_t addr, void *buf, size_t n, int write) {
     }
     if (ok) {
         for (uint64_t k = addr & ~(KP - 1); k < addr + n; k += KP)
-            mprotect((void *)(uintptr_t)k, KP, PROT_READ | PROT_WRITE);
+            kprot((void *)(uintptr_t)k, KP, PROT_READ | PROT_WRITE);
         if (write) memcpy((void *)(uintptr_t)addr, buf, n);
         else memcpy(buf, (const void *)(uintptr_t)addr, n);
         for (uint64_t k = addr & ~(KP - 1); k < addr + n && write; k += KP) ww_mark(k);
@@ -325,7 +388,7 @@ int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end) {
 // Closes [run, run_end) to writes, then unmarks what plat_mem_written reported there (the pending bits).
 static void ww_close_run(uint64_t run, uint64_t run_end, int prot) {
     if (run_end <= run) return;
-    mprotect((void *)(uintptr_t)run, run_end - run, prot);
+    kprot((void *)(uintptr_t)run, run_end - run, prot);
     for (uint64_t k = run; k < run_end; k += KP) {
         uint16_t *w = ww_of(k);
         if (w) *w = (uint16_t)(*w & (WW_ON | WW_ALL) & ~(*w >> WW_PEND_SHIFT & WW_ALL));
@@ -339,6 +402,8 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
     if (addr + n > PS_LIMIT) return UINT64_MAX;
     uint64_t got = 0, end = addr + n, run = 0, run_end = 0;
     int run_prot = 0;
+    uint64_t q0 = plat_now_ns();
+    st_add(&st_ww_n, 1), st_add(&st_ww_bytes, n);
     for (uint64_t k = addr & ~(KP - 1); k < end; k += KP) {   // watched throughout, or untracked (set at reservation)
         uint16_t *w = ww_of(k);
         if (!w || !(*w & WW_ON)) return UINT64_MAX;
@@ -373,6 +438,7 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
     }
     ww_close_run(run, run_end, run_prot);
     plat_mutex_unlock(&vm_lock);
+    st_add(&st_ww_ns, plat_now_ns() - q0);
     return got;
 }
 
@@ -445,20 +511,27 @@ static int in_lazy(uint64_t a) {
 }
 
 // 1 when the access at a (write or not) is one the PS5 mechanism caused and has now cleared: retry it.
+// 1 handled, 0 not ours (a real fault, or the hook's), -1 a committed page whose memory could not be mapped: on Linux
+// the kernel never fails a first touch (the OOM killer ends the process instead), so the title stops with a report
+// rather than retrying the access for ever (Step 4: run 21 retried 30,166 failed backings and hung).
 static int ps5_fault(uint64_t a, int write) {
     uint64_t k = a & ~(KP - 1);
     if (in_lazy(a)) {
         plat_mutex_lock(&vm_lock);
         int ok = is_backed(k) || back(k, PROT_READ | PROT_WRITE);
         plat_mutex_unlock(&vm_lock);
-        return ok;
+        return ok ? 1 : -1;
     }
     int s = st_get(a);
     if (s < PS_NONE) return 0;   // not committed: a real fault
+    uint64_t w0 = plat_now_ns();
     plat_mutex_lock(&vm_lock);
-    if (!is_backed(k) && !back(k, kpage_prot(k))) {
+    st_add(&st_lockwait_ns, plat_now_ns() - w0);
+    int fresh = !is_backed(k), closed = write && ww_closed(k);
+    st_add(fresh ? &st_fault_touch : closed ? &st_fault_ww : &st_fault_other, 1);
+    if (fresh && !back(k, kpage_prot(k))) {
         plat_mutex_unlock(&vm_lock);
-        return 0;
+        return -1;
     }
     plat_mutex_unlock(&vm_lock);
     int own_ok = write ? s == PS_RW : s >= PS_READ;
@@ -475,7 +548,7 @@ static int ps5_fault(uint64_t a, int write) {
     if (write) ww_mark(k);
     int now = kpage_prot(k), allowed = write ? (now & PROT_WRITE) != 0 : (now & PROT_READ) != 0;
     if (!allowed) {   // a sibling stays stricter: the page opens for this access anyway (counted)
-        mprotect((void *)(uintptr_t)k, KP, write ? PROT_READ | PROT_WRITE : PROT_READ);
+        kprot((void *)(uintptr_t)k, KP, write ? PROT_READ | PROT_WRITE : PROT_READ);
         sibling_lifts++;
     } else {
         apply(k);   // the protection the state gives now (the write mark above opens a watched page)
@@ -485,6 +558,8 @@ static int ps5_fault(uint64_t a, int write) {
 }
 
 static void fault_handler(int sig, siginfo_t *si, void *uc) {
+    uint64_t t0 = plat_now_ns();
+    st_add(&st_fault_n, 1);
     ucontext_t *u = uc;
     long err = (long)u->uc_mcontext.mc_err;   // x86's page fault error code: 2 a write, 16 an instruction fetch
     uint64_t a = (uint64_t)(uintptr_t)si->si_addr;
@@ -492,8 +567,25 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
     if (segv && watch_fn && (err & 2) && watch_fn(a, (uint64_t)u->uc_mcontext.mc_rip)) return;
     plat_fault_write = (err & 2) != 0, plat_fault_pc = (uint64_t)u->uc_mcontext.mc_rip;
     plat_fault_ret = *(const uint64_t *)(uintptr_t)u->uc_mcontext.mc_rsp;
-    if (segv && !(err & 16) && ps5_fault(a, (err & 2) != 0)) return;
-    if (segv && fault_hook && fault_hook(a)) return;
+    int mine = segv && !(err & 16) ? ps5_fault(a, (err & 2) != 0) : 0;
+    if (mine > 0) {
+        st_add(&st_fault_ns, plat_now_ns() - t0);
+        return;
+    }
+    if (mine < 0) {   // out of memory or page tables for a committed page: say so, then the crash report below
+        int ct = -1, cf = -1, gt = -1, gf = -1;
+        (void)sceKernelGetPageTableStats(&ct, &cf, &gt, &gf);
+        char line[256];
+        int n = snprintf(line, sizeof line,
+                         "[host] FATAL: no memory to back committed page %p (allocate %#x map %#x; cpu page tables %d "
+                         "free %d, gpu %d free %d)\n",
+                         si->si_addr, (unsigned)st_fail_ra, (unsigned)st_fail_rm, ct, cf, gt, gf);
+        if (n > 0) (void)!write(ps5_log_fd, line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
+    }
+    if (mine == 0 && segv && fault_hook && fault_hook(a)) {
+        if (a < PS_LIMIT && st_get(a) >= PS_NONE && !is_backed(a & ~(KP - 1))) st_add(&st_hook_after_fail, 1);
+        return;
+    }
     uintptr_t rip = (uintptr_t)u->uc_mcontext.mc_rip;
     Dl_info at = {0}, self = {0};
     int in_module = dladdr((void *)rip, &at) != 0, ours = 0;
@@ -512,7 +604,7 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
         int n = snprintf(line, sizeof line, "[host] fatal signal %d at %#lx (%s+%#lx) addr %p err %#lx\n", sig,
                          (unsigned long)rip, at.dli_fname ? at.dli_fname : "?",
                          (unsigned long)(rip - (uintptr_t)at.dli_fbase), si->si_addr, (unsigned long)err);
-        if (n > 0) (void)!write(2, line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
+        if (n > 0) (void)!write(ps5_log_fd, line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
     }
     signal(sig, SIG_DFL);   // the faulting instruction runs again and gets the default action
 }
@@ -597,3 +689,45 @@ int plat_mem_replace_anon(uint64_t addr, uint64_t n) {
 }
 
 uint64_t ps5_mem_sibling_lifts(void) { return __atomic_load_n(&sibling_lifts, __ATOMIC_RELAXED); }
+
+// The counters above as one line for the title's memory report (ps5_main.c).
+// One short line for the page-table sampler (ps5_main.c pt_watch): guest backing so far.
+int ps5_mem_brief(char *out, size_t cap) {
+    return snprintf(out, cap, "guest: backing %llu calls %.1f MiB, stretches with pages %llu, blocks %llu, unback %llu, "
+                    "failed %llu",
+                    (unsigned long long)__atomic_load_n(&st_back_n, __ATOMIC_RELAXED),
+                    __atomic_load_n(&st_back_bytes, __ATOMIC_RELAXED) / 1048576.0,
+                    (unsigned long long)__atomic_load_n(&st_regions, __ATOMIC_RELAXED),
+                    (unsigned long long)__atomic_load_n(&st_region_blocks, __ATOMIC_RELAXED),
+                    (unsigned long long)__atomic_load_n(&st_unback_n, __ATOMIC_RELAXED),
+                    (unsigned long long)(__atomic_load_n(&st_block_fail, __ATOMIC_RELAXED) +
+                                         __atomic_load_n(&st_page_fail, __ATOMIC_RELAXED)));
+}
+
+int ps5_mem_stats(char *out, size_t cap) {
+    uint64_t fn = __atomic_load_n(&st_fault_n, __ATOMIC_RELAXED), kn = __atomic_load_n(&st_kprot_n, __ATOMIC_RELAXED),
+             bn = __atomic_load_n(&st_back_n, __ATOMIC_RELAXED);
+    VqEntry e = st_fail_entry;
+    e.name[sizeof e.name - 1] = 0;
+    int ct = -1, cf = -1, gt = -1, gf = -1;
+    (void)sceKernelGetPageTableStats(&ct, &cf, &gt, &gf);
+    int k = snprintf(out, cap, "page tables cpu %d free %d, gpu %d free %d; 2 MiB stretches with 16 KiB backings %llu, whole 2 MiB blocks %llu; query of the last failed page %#x: %p-%p offset %#llx prot %#x type %d flags %#x '%s'; ",
+                     ct, cf, gt, gf, (unsigned long long)st_regions, (unsigned long long)st_region_blocks, (unsigned)st_fail_vq, e.start, e.end, (unsigned long long)e.offset, (unsigned)e.protection, e.type,
+                     (unsigned)e.flags, e.name);
+    if (k < 0 || (size_t)k >= cap) return k;
+    out += k, cap -= (size_t)k;
+    return k + snprintf(out, cap,
+                    "faults %llu (first touch %llu, write watch %llu, other %llu) %.2f s in all; backing %llu calls %.1f MiB "
+                    "%.2f s (2 MiB blocks failed %llu, pages failed %llu; last %#llx states %#llx allocate %#x map %#x; hook "
+                    "retried unbacked %llu; unback %llu, re-reserve failed %llu (%#x), release failed %llu (%#x)); mprotect %llu %.2f s; fault lock waits %.2f s; write-watch queries %llu, "
+                    "%.1f GiB, %.2f s",
+                    (unsigned long long)fn, (unsigned long long)st_fault_touch, (unsigned long long)st_fault_ww,
+                    (unsigned long long)st_fault_other, st_fault_ns / 1e9, (unsigned long long)bn,
+                    st_back_bytes / 1048576.0, st_back_ns / 1e9, (unsigned long long)st_block_fail,
+                    (unsigned long long)st_page_fail, (unsigned long long)st_fail_k, (unsigned long long)st_fail_state,
+                    (unsigned)st_fail_ra, (unsigned)st_fail_rm, (unsigned long long)st_hook_after_fail,
+                    (unsigned long long)st_unback_n, (unsigned long long)st_unback_fail, (unsigned)st_unback_r,
+                    (unsigned long long)st_release_fail, (unsigned)st_release_r, (unsigned long long)kn,
+                    st_kprot_ns / 1e9, st_lockwait_ns / 1e9, (unsigned long long)st_ww_n, st_ww_bytes / 1073741824.0,
+                    st_ww_ns / 1e9);
+}
