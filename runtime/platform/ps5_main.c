@@ -28,6 +28,7 @@ int sceSystemServiceHideSplashScreen(void);
 int sceSystemServiceLoadExec(const char *path, const char *const *argv);
 int sceKernelUsleep(uint32_t microseconds);
 static int log_fds[2];
+int ps5_log_fd = 2;   // the log's descriptor for raw writes (a signal handler's lines): 1 and 2 are not the log here
 
 // The platform heap every malloc goes to (PS5_Vulkan's link recipe wraps malloc into it: ps5platform/heap.h of the
 // SDK fork's platform layer, ref/PS5_PayloadSDK/platform/include/ps5platform/heap.h:54-79) and the flexible memory
@@ -58,6 +59,8 @@ static void memory_report(const char *when) {
             when, (unsigned long long)h.range_base, (unsigned long long)h.range_bytes, h.mapped_bytes / 1048576.0,
             h.peak_bytes / 1048576.0, h.in_use_bytes / 1048576.0, h.segments, h.arenas, h.libc_fallbacks,
             flex / 1048576.0, fr, dfree / 1048576.0, plat_process_uptime_ns() / 1e9);
+    char st[900];
+    if (ps5_mem_stats(st, sizeof st) > 0) fprintf(stderr, "[host] ps5: memory %s: %s\n", when, st);
 }
 
 // Descriptors 1 and 2, and so the streams stdout and stderr, go to LOG. A title may not dup2 (the console refuses it
@@ -72,6 +75,7 @@ static int log_open(void) {
     int out = open(LOG, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
     int err = open(LOG, O_WRONLY | O_APPEND);
     log_fds[0] = out, log_fds[1] = err;
+    ps5_log_fd = err;
     int ok = out == 1 && err == 2;
     if (!ok) {   // the streams at least (title run 3: freopen moved both)
         (void)!freopen(LOG, "a", stdout);
@@ -189,6 +193,27 @@ static int list_test(const char *dir) {
 // removed. Not through the log: a stuck thread may hold its stream's lock.
 #define DUMP_TRIGGER PS5_DIR "/dump-threads"
 #define DUMP_OUT PS5_DIR "/threads.txt"
+// Step 4 diagnosis: who uses the title's 16,384 CPU page tables (one per 2 MiB stretch with any mapping)? For the first
+// 180 s, every 100 ms, a line whenever the free count fell by 64 or more since the last line, with guest backing so far;
+// in the log among the game's own lines, so the drops can be placed.
+int sceKernelGetPageTableStats(int *cpu_total, int *cpu_free, int *gpu_total, int *gpu_free);
+static void pt_watch(void *arg) {
+    (void)arg;
+    int last = 1 << 30;
+    for (int i = 0; i < 1800; i++) {
+        int ct = 0, cf = 0, gt = 0, gf = 0;
+        if (sceKernelGetPageTableStats(&ct, &cf, &gt, &gf)) return;
+        if (cf <= last - 64 || (cf == 0 && last)) {
+            char b[256];
+            ps5_mem_brief(b, sizeof b);
+            fprintf(stderr, "[host] ps5: page tables at %.1f s: cpu free %d, gpu free %d; %s\n",
+                    plat_process_uptime_ns() / 1e9, cf, gf, b);
+            last = cf;
+        }
+        plat_sleep_ms(100);
+    }
+}
+
 static void dump_watch(void *arg) {
     (void)arg;
     for (int n = 1, tick = 0;; ) {
@@ -248,6 +273,129 @@ static int signal_test(void) {
     return 0;
 }
 
+// --ps5-map-test: how many separate direct-memory mappings a title gets (Step 4: mapping failed with ENOMEM after ~32k
+// 16 KiB backings): (1) 16 KiB pages each with its own allocation in a reserved 2 GiB range; (2) one 1 GiB allocation
+// mapped 16 KiB at a time at matching offsets (contiguous neighbours: does the kernel merge them?).
+#include <sys/mman.h>
+int sceKernelReserveVirtualRange(void **addr, size_t len, int flags, size_t align);
+int sceKernelAllocateDirectMemory(int64_t start, int64_t end, size_t len, size_t align, int type, int64_t *phys);
+int sceKernelMapDirectMemory(void **addr, size_t len, int prot, int flags, int64_t phys, size_t align);
+// CPU and GPU page tables of the process, in use and free (libkernel; EglantinePS5 src/host_memory.cpp:509-516 reads it
+// the same way to keep page tables back).
+int sceKernelGetPageTableStats(int *cpu_total, int *cpu_free, int *gpu_total, int *gpu_free);
+static void pt_stats(const char *when) {
+    int ct = -1, cf = -1, gt = -1, gf = -1, r = sceKernelGetPageTableStats(&ct, &cf, &gt, &gf);
+    printf("ps5-map-test: page tables %s: cpu %d free %d, gpu %d free %d (%#x)\n", when, ct, cf, gt, gf, (unsigned)r);
+}
+// Maps up to `most` whole 2 MiB blocks from `first` (2 MiB-aligned in memory and in address) and writes each; returns how
+// many, with the last allocate and map results.
+static int map_blocks(uint64_t first, int most, int *ba, int *bm) {
+    int nb = 0;
+    *ba = *bm = 0;
+    for (; nb < most; nb++) {
+        int64_t phys = 0;
+        void *at = (void *)(uintptr_t)(first + ((uint64_t)nb << 21));
+        if ((*ba = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), 2u << 20, 2u << 20, 12, &phys))) break;
+        if ((*bm = sceKernelMapDirectMemory(&at, 2u << 20, PROT_READ | PROT_WRITE, MAP_FIXED, phys, 2u << 20))) break;
+        ((volatile char *)at)[0] = 1, ((volatile char *)at)[(2u << 20) - 1] = 1;
+    }
+    return nb;
+}
+static int free_tables(void) {
+    int t = -1, f = -1, gt, gf;
+    (void)sceKernelGetPageTableStats(&t, &f, &gt, &gf);
+    return f;
+}
+static int map_test(void) {
+    const size_t kp = 0x4000, span = 1ull << 30;
+    void *base = NULL;
+    int r = sceKernelReserveVirtualRange(&base, span, 0, 2u << 20), n = 0, ra = 0, rm = 0;
+    printf("ps5-map-test: reserve 1 GiB %#x at %p\n", (unsigned)r, base);
+    for (; !r && n < (int)(span / kp); n++) {
+        int64_t phys = 0;
+        void *at = (char *)base + (size_t)n * kp;
+        if ((ra = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), kp, kp, 12, &phys))) break;
+        if ((rm = sceKernelMapDirectMemory(&at, kp, PROT_READ | PROT_WRITE, MAP_FIXED, phys, kp))) break;
+        if (!(n % 65536)) printf("ps5-map-test: (1) %d mappings so far\n", n);
+    }
+    printf("ps5-map-test: (1) separate 16 KiB mappings: %d made, then allocate %#x map %#x\n", n, (unsigned)ra, (unsigned)rm);
+    munmap(base, span);   // (the direct memory of (1) stays allocated: this process ends after the test)
+    void *b2 = NULL;
+    int64_t big = 0;
+    r = sceKernelReserveVirtualRange(&b2, 1ull << 30, 0, 2u << 20);
+    ra = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), 1ull << 30, 2u << 20, 12, &big);
+    int m = 0;
+    rm = 0;
+    for (; !r && !ra && m < (int)((1ull << 30) / kp); m++) {
+        void *at = (char *)b2 + (size_t)m * kp;
+        if ((rm = sceKernelMapDirectMemory(&at, kp, PROT_READ | PROT_WRITE, MAP_FIXED, big + (int64_t)((size_t)m * kp), kp)))
+            break;
+    }
+    printf("ps5-map-test: (2) adjacent 16 KiB maps of one 1 GiB allocation: %d made of %d (reserve %#x allocate %#x, last "
+           "map %#x)\n", m, (int)((1ull << 30) / kp), (unsigned)r, (unsigned)ra, (unsigned)rm);
+    // (3) scattered: one 16 KiB page per 2 MiB (each needs its own page-table page), as the game's guest memory is
+    // touched, over two 64 GiB ranges reserved at the guest's fixed addresses (free in this test mode): how many before
+    // mapping fails?
+    static const uint64_t bases[2] = {0x1000000000ull, 0x3000000000ull};
+    pt_stats("before (3)");
+    int q = 0, rr[2];
+    ra = rm = 0;
+    for (int g = 0; g < 2; g++) {
+        void *at = (void *)(uintptr_t)bases[g];
+        rr[g] = sceKernelReserveVirtualRange(&at, 64ull << 30, 0x10 | 0x80, 2u << 20);   // MAP_FIXED | no replace
+    }
+    // (4a) while page tables are free: 64 whole 2 MiB blocks in a 1 GiB region of their own (the second range's top half,
+    // which (3) never reaches). How many page tables do they take?
+    if (!rr[0] && !rr[1]) {
+        int ba, bm, f0 = free_tables(), nb = map_blocks(bases[1] + (32ull << 30), 64, &ba, &bm);
+        printf("ps5-map-test: (4a) whole 2 MiB blocks: %d of 64 mapped and written (allocate %#x map %#x); free cpu page "
+               "tables %d -> %d\n", nb, (unsigned)ba, (unsigned)bm, f0, free_tables());
+    }
+    for (int g = 0; g < 2 && !rr[0] && !rr[1] && !ra && !rm; g++)
+        for (int i = 0; i < 32768; i++, q++) {
+            int64_t phys = 0;
+            void *at = (void *)(uintptr_t)(bases[g] + ((uint64_t)i << 21));
+            if ((ra = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), kp, kp, 12, &phys))) break;
+            if ((rm = sceKernelMapDirectMemory(&at, kp, PROT_READ | PROT_WRITE, MAP_FIXED, phys, kp))) break;
+            if (!(q % 8192)) printf("ps5-map-test: (3) %d scattered so far\n", q), pt_stats("during (3)");
+        }
+    printf("ps5-map-test: (3) scattered 16 KiB mappings, one per 2 MiB: %d made of 65536 (reserve %#x %#x, then allocate "
+           "%#x map %#x)\n", q, (unsigned)rr[0], (unsigned)rr[1], (unsigned)ra, (unsigned)rm);
+    pt_stats("after (3)");
+    // (4b) with no page table free, whole 2 MiB blocks in the 1 GiB region where (3) stopped: its directory page exists,
+    // so a large page there needs no new table. Does it map?
+    {
+        uint64_t first = bases[0] + ((uint64_t)(q + 1) << 21), end = (first + (1ull << 30) - 1) & ~((1ull << 30) - 1);
+        int most = (int)((end - first) >> 21), ba, bm, f0 = free_tables();
+        if (most > 64) most = 64;
+        int nb = map_blocks(first, most, &ba, &bm);
+        printf("ps5-map-test: (4b) whole 2 MiB blocks from %#llx: %d of %d mapped and written (allocate %#x map %#x); free "
+               "cpu page tables %d -> %d\n", (unsigned long long)first, nb, most, (unsigned)ba, (unsigned)bm, f0, free_tables());
+    }
+    return 0;
+}
+
+// --ps5-block-test: ps5_mem.c in a title on real 2 MiB blocks (Step 4: re-backing 2 MiB-aligned pages failed with
+// ENOMEM in the game): a block backed at once, page 0 and page 1 decommitted and backed again, then the counters.
+static int block_test(void) {
+    const uint64_t at = 0x3800000000ull, blk = 2ull << 20, kp = 0x4000;   // a free spot in the guest's window
+    int ok = plat_mem_reserve(at, 4 * blk, 0) && plat_mem_commit(at, 4 * blk);
+    printf("ps5-block-test: reserve+commit 8 MiB at %#llx: %d\n", (unsigned long long)at, ok);
+    for (int b = 0; ok && b < 4; b++) {
+        volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)(at + (uint64_t)b * blk);
+        p[kp] = 1;                                   // backs the whole block
+        uint64_t page = b & 1 ? kp : 0;              // blocks 0, 2: page 0; blocks 1, 3: page 1
+        plat_mem_decommit((uint64_t)(uintptr_t)p + page, kp);
+        plat_mem_commit((uint64_t)(uintptr_t)p + page, kp);
+        p[page] = 7;                                 // re-backs that page alone
+        printf("ps5-block-test: block %d page %llu: read %d (want 7)\n", b, (unsigned long long)(page / kp), p[page]);
+    }
+    char st[900];
+    ps5_mem_stats(st, sizeof st);
+    printf("ps5-block-test: %s\n", st);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     ps5_dump_register("main");
@@ -289,10 +437,13 @@ int main(int argc, char **argv) {
     for (int i = 1; i < n; i++) fprintf(stderr, " %s", args[i]);
     fputc('\n', stderr);
     memory_report("at start");
+    if (getenv("MKW_PS5_PT_WATCH")) plat_thread_spawn(pt_watch, NULL, "pt watch", 0);   // after args.txt's settings
     int status = n >= 2 && !strcmp(args[1], "--ps5-pad-test")    ? pad_test(n >= 3 ? atoi(args[2]) : 20)
                  : n >= 2 && !strcmp(args[1], "--ps5-tone-test") ? tone_test(n >= 3 ? atoi(args[2]) : 3)
                  : n >= 3 && !strcmp(args[1], "--ps5-list-test") ? list_test(args[2])
                  : n >= 2 && !strcmp(args[1], "--ps5-signal-test") ? signal_test()
+                 : n >= 2 && !strcmp(args[1], "--ps5-map-test") ? map_test()
+                 : n >= 2 && !strcmp(args[1], "--ps5-block-test") ? block_test()
                                                                   : mkw_main(n, args);
     fprintf(stderr, "[host] ps5: mkw_main returned %d\n", status);
     return status;

@@ -26,3 +26,7 @@ void ps5_dump_register(const char *name);
 void ps5_dump_threads(int fd);
 // The threads named name, count times every interval_ms (a profile of one thread), to fd.
 void ps5_dump_sample(int fd, const char *name, int count, int interval_ms);
+// ps5_mem.c: faults, backing and mprotect counts and times, as one line.
+int ps5_mem_stats(char *out, size_t cap);
+int ps5_mem_brief(char *out, size_t cap);
+extern int ps5_log_fd;   // ps5_main.c: where raw write(2) lines reach the log
