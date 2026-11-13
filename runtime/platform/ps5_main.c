@@ -20,6 +20,9 @@
 #define MAX_ARGS 64
 
 int mkw_main(int argc, char **argv);
+void cfg_init(void);
+void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
+uint32_t input_player_mask(void);
 int sceSystemServiceHideSplashScreen(void);
 int sceSystemServiceLoadExec(const char *path, const char *const *argv);
 int sceKernelUsleep(uint32_t microseconds);
@@ -55,6 +58,62 @@ void catchReturnFromMain(int status) {
     int r = sceSystemServiceLoadExec("exit", NULL);
     fprintf(stderr, "[host] ps5: sceSystemServiceLoadExec(\"exit\") = %#x; waiting for the shell\n", (unsigned)r);
     for (;;) sceKernelUsleep(100000);
+}
+
+// --ps5-pad-test [SECONDS]: Step 3's pad check on the console, through input.c and platform/ps5_sdl.c as the game
+// reads it: every change of player 1's buttons and sticks for SECONDS (default 20), one log line each.
+static int pad_test(int seconds) {
+    cfg_init();
+    uint64_t b0 = ~0ull, b;
+    int32_t s0[4] = {0}, s[4];
+    uint64_t end = plat_now_ns() + (uint64_t)seconds * 1000000000ull;
+    int changes = 0;
+    printf("ps5-pad-test: %d s, players mask %#x\n", seconds, input_player_mask());
+    while (plat_now_ns() < end) {
+        input_poll(&b, &s[0], &s[1], &s[2], &s[3]);
+        int moved = 0;
+        for (int i = 0; i < 4; i++) moved |= (s[i] > s0[i] ? s[i] - s0[i] : s0[i] - s[i]) > 4096;
+        if (b != b0 || moved) {
+            printf("ps5-pad-test: %.2f s buttons %#llx sticks %d %d %d %d\n",
+                   (double)(plat_now_ns() + (uint64_t)seconds * 1000000000ull - end) / 1e9, (unsigned long long)b, s[0],
+                   s[1], s[2], s[3]);
+            b0 = b, memcpy(s0, s, sizeof s0);
+            changes++;
+        }
+        plat_sleep_ms(10);
+    }
+    printf("ps5-pad-test: done, %d changes, players mask %#x\n", changes, input_player_mask());
+    return 0;
+}
+
+// --ps5-tone-test [SECONDS]: Step 3's sound check: a 440 Hz tone at a quarter of full scale for SECONDS (default 3)
+// through platform/ps5_sdl.c's audio stream, as audio_mixer.c opens it.
+#include <math.h>
+#include <SDL3/SDL.h>
+static void tone_pull(void *user, SDL_AudioStream *stream, int additional, int total) {
+    (void)total;
+    double *phase = user;
+    float buf[2 * 256];
+    int frames = additional / (int)(2 * sizeof(float));
+    if (frames > 256) frames = 256;
+    for (int i = 0; i < frames; i++, *phase += 2 * M_PI * 440.0 / 48000.0) buf[2 * i] = buf[2 * i + 1] = 0.25f * (float)sin(*phase);
+    SDL_PutAudioStreamData(stream, buf, frames * (int)(2 * sizeof(float)));
+}
+
+static int tone_test(int seconds) {
+    static double phase;
+    SDL_AudioSpec spec = {SDL_AUDIO_F32, 2, 48000};
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) return printf("ps5-tone-test: init failed (%s)\n", SDL_GetError()), 1;
+    SDL_AudioStream *s = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, tone_pull, &phase);
+    if (!s || !SDL_ResumeAudioStreamDevice(s)) return printf("ps5-tone-test: no stream (%s)\n", SDL_GetError()), 1;
+    uint64_t t0 = plat_now_ns();
+    plat_sleep_ms((uint32_t)seconds * 1000u);
+    double played = phase / (2 * M_PI * 440.0 / 48000.0);
+    SDL_DestroyAudioStream(s);
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    double secs = (double)(plat_now_ns() - t0) / 1e9;
+    printf("ps5-tone-test: %.0f frames in %.2f s = %.0f frames/s (48000 expected)\n", played, secs, played / secs);
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -95,7 +154,9 @@ int main(int argc, char **argv) {
             log_ok ? "on descriptors 1 and 2" : "NOT on 1 and 2", log_fds[0], log_fds[1], envs, n - 1, ARGS);
     for (int i = 1; i < n; i++) fprintf(stderr, " %s", args[i]);
     fputc('\n', stderr);
-    int status = mkw_main(n, args);
+    int status = n >= 2 && !strcmp(args[1], "--ps5-pad-test")    ? pad_test(n >= 3 ? atoi(args[2]) : 20)
+                 : n >= 2 && !strcmp(args[1], "--ps5-tone-test") ? tone_test(n >= 3 ? atoi(args[2]) : 3)
+                                                                  : mkw_main(n, args);
     fprintf(stderr, "[host] ps5: mkw_main returned %d\n", status);
     return status;
 }
