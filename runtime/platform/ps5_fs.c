@@ -206,11 +206,28 @@ void plat_file_close(PlatFile *f) {
     if (f) close(fd_of(f));
 }
 
+// The kernel's write into the buffer does not fault into ps5_mem.c: the pages are made ready first, and where a
+// stricter 4 KiB neighbour keeps the kernel page closed (EFAULT) while the guest may write the buffer itself, the
+// bytes go through a bounce buffer and a copy, which faults like any write of the guest (hooks, write watch). A buffer
+// the guest may not write still gets -2, as linux_fs.c's EFAULT does.
 int64_t plat_file_pread(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
     ssize_t k;
+    uint64_t a = (uint64_t)(uintptr_t)buf;
+    ps5_mem_prepare_write(a, n);
     do k = pread(fd_of(f), buf, n, (off_t)off);
     while (k < 0 && errno == EINTR);
-    return k >= 0 ? k : errno == EFAULT ? -2 : -1;
+    if (k >= 0 || errno != EFAULT) return k >= 0 ? k : -1;
+    static int told;
+    char why[160];
+    if (!ps5_mem_writable(a, n, why, sizeof why)) return -2;
+    if (!told++) fprintf(stderr, "[host] fs: ps5: pread of %u bytes into %p through a bounce buffer (%s)\n", n, buf, why);
+    void *tmp = malloc(n ? n : 1);
+    if (!tmp) return -1;
+    do k = pread(fd_of(f), tmp, n, (off_t)off);
+    while (k < 0 && errno == EINTR);
+    if (k > 0) memcpy(buf, tmp, (size_t)k);
+    free(tmp);
+    return k >= 0 ? k : -1;
 }
 
 int plat_file_id(PlatFile *f, PlatFileId *out) {

@@ -376,6 +376,52 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
     return got;
 }
 
+// A write by the kernel itself (pread into a buffer) does not fault into the handler: it fails with EFAULT on a page
+// that has no direct memory yet or that write watch keeps closed (the game's first RomFS read, 13/11/2026: "the buffer
+// is not writable"); Linux's kernel backs and tracks such pages itself. So a buffer the kernel is about to fill is made
+// ready as a first write would make it: backed, marked written where watched, opened. Pages the guest may not write
+// stay as they are, and the call fails as it should.
+static int in_lazy(uint64_t a);
+
+void ps5_mem_prepare_write(uint64_t a, uint64_t n) {
+    if (!n) return;
+    plat_mutex_lock(&vm_lock);
+    for (uint64_t k = a & ~(KP - 1); k < a + n; k += KP) {
+        if (in_lazy(k)) {
+            if (!is_backed(k)) back(k, PROT_READ | PROT_WRITE);
+            continue;
+        }
+        if (k >= PS_LIMIT) continue;
+        int writable = 0;
+        for (uint64_t i = 0; i < SUB; i++) {
+            uint64_t p = k + i * PG;
+            writable |= p + PG > a && p < a + n && st_get(p) == PS_RW;
+        }
+        if (!writable || (!is_backed(k) && !back(k, kpage_prot(k)))) continue;
+        ww_mark(k);
+        apply(k);
+    }
+    plat_mutex_unlock(&vm_lock);
+}
+
+// Whether the guest may write every 4 KiB page of [a, a + n) (committed read-write, or a lazily backed range), and
+// (diagnosis) the state and the kernel protection of the first page where the kernel page itself refuses writes.
+int ps5_mem_writable(uint64_t a, uint64_t n, char *why, size_t cap) {
+    if (why && cap) why[0] = 0;
+    int ok = 1;
+    plat_mutex_lock(&vm_lock);
+    for (uint64_t p = a & ~(PG - 1); p < a + n && ok; p += PG)
+        ok = in_lazy(p) || (p < PS_LIMIT && st_get(p) == PS_RW);
+    for (uint64_t k = a & ~(KP - 1); k < a + n && why && !why[0]; k += KP) {
+        if (k >= PS_LIMIT || in_lazy(k) || (kpage_prot(k) & PROT_WRITE)) continue;
+        uint16_t *w = ww_of(k);
+        snprintf(why, cap, "kernel page %#llx: states %d %d %d %d, backed %d, watch %#x", (unsigned long long)k,
+                 st_get(k), st_get(k + PG), st_get(k + 2 * PG), st_get(k + 3 * PG), is_backed(k), w ? *w : 0);
+    }
+    plat_mutex_unlock(&vm_lock);
+    return ok;
+}
+
 uint64_t plat_mem_populated(uint64_t addr, uint64_t n, uint64_t (*runs)[2], uint64_t max) {
     (void)addr, (void)n, (void)runs;
     return max ? UINT64_MAX : 0;
