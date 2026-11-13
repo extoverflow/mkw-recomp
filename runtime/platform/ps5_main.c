@@ -44,6 +44,10 @@ struct ps5_heap_stats {
     size_t in_use_bytes;
 };
 void ps5_heap_stats(struct ps5_heap_stats *stats);
+// Gives back each arena's free top and its empty segments (the SDK fork's platform heap @ 3345cde, heap.h:72-77: "a
+// title calls this now and then (every 10 s, say) so that what a burst took goes back to the pool it shares with its
+// GPU and its guest"). Weak: the SDK's older platform layer (b83202b) has none.
+__attribute__((weak)) void ps5_heap_trim(void);
 int sceKernelAvailableFlexibleMemorySize(size_t *size);
 int sceKernelAvailableDirectMemorySize(int64_t start, int64_t end, size_t align, int64_t *phys, size_t *size);
 int64_t sceKernelGetDirectMemorySize(void);
@@ -253,9 +257,11 @@ static void pt_watch(void *arg) {
 // stopped holding one of them would otherwise stop the thread dump too (play test p4).
 static void mem_watch(void *arg) {
     (void)arg;
-    for (;;) {
-        plat_sleep_ms(30000);
-        memory_report("every 30 s");
+    if (!ps5_heap_trim) fprintf(stderr, "[host] ps5: the platform heap has no ps5_heap_trim (older SDK): not trimmed\n");
+    for (int tick = 1;; tick++) {
+        plat_sleep_ms(10000);
+        if (ps5_heap_trim) ps5_heap_trim();
+        if (tick % 3 == 0) memory_report("every 30 s");
     }
 }
 
