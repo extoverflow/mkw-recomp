@@ -13,4 +13,10 @@ int pthread_getname_np(struct pthread *, char *, __SIZE_TYPE__);
 // a feature Zen 2 lacks (AVX-512) would need its own answer here.
 #define __builtin_cpu_init() ((void)0)
 #define __builtin_cpu_supports(feature) 1
+// The runtime's main() (core/boot/main.c) is called by the title's entry, platform/ps5_main.c, as mkw_main: that file
+// reads the arguments from a file and sets up the log first.
+#define main mkw_main
+// RADV is linked into the title and defines Mesa's vk_sync_finish; the runtime's own (gfx/vk/device/vk_sync.c) takes
+// another name here (the only global both define, by llvm-nm over both, 13/11/2026).
+#define vk_sync_finish mkw_vk_sync_finish
 #endif

@@ -123,11 +123,16 @@ int plat_stderr_path(char *out, size_t cap) {
 // ps5.c's stack report, when ps5.c is linked in (the payload tests of ps5_sys.c alone do not have it).
 __attribute__((weak)) int ps5_stack_report(char *out, size_t cap, int each);
 
+// A title asks the shell to close it (ps5_main.c); _exit would be reported as a crash. Weak: the payload tests have no
+// ps5_main.c and end with _exit as on Linux.
+__attribute__((weak)) void catchReturnFromMain(int status);
+
 void plat_exit(int code) {
     char rep[256];
     if (ps5_stack_report && ps5_stack_report(rep, sizeof rep, 0) > 0) fputs(rep, stderr);
     fflush(stdout);
     fflush(stderr);
+    if (catchReturnFromMain) catchReturnFromMain(code);
     _exit(code);
 }
 
@@ -263,3 +268,23 @@ int64_t plat_threads_cpu_ns_named(const char *name) {
     (void)name;
     return -1;
 }
+
+// No FIFOs for a title (and no mkfifo in the modules it loads): core/base/ctl.c's MKW_CTL then logs that it is off.
+int mkfifo(const char *path, mode_t mode) {
+    (void)path, (void)mode;
+    errno = ENOTSUP;
+    return -1;
+}
+
+// The console's libzstd.a (built with tracing) calls these weak hooks; nothing defines them, and the title converter
+// refuses an import nobody exports. 0: no trace (zstd's lib/common/zstd_trace.h, ZSTD_TraceCtx is unsigned long long).
+unsigned long long ZSTD_trace_compress_begin(const void *cctx) {
+    (void)cctx;
+    return 0;
+}
+void ZSTD_trace_compress_end(unsigned long long ctx, const void *trace) { (void)ctx, (void)trace; }
+unsigned long long ZSTD_trace_decompress_begin(const void *dctx) {
+    (void)dctx;
+    return 0;
+}
+void ZSTD_trace_decompress_end(unsigned long long ctx, const void *trace) { (void)ctx, (void)trace; }
