@@ -45,6 +45,22 @@ void ps5_heap_stats(struct ps5_heap_stats *stats);
 int sceKernelAvailableFlexibleMemorySize(size_t *size);
 int sceKernelAvailableDirectMemorySize(int64_t start, int64_t end, size_t align, int64_t *phys, size_t *size);
 int64_t sceKernelGetDirectMemorySize(void);
+// The allocated direct-memory region at or after an offset (flags 1: the next one), as EglantinePS5 walks the pool
+// (headless/performance.cpp:531, :738 @ 64dbcde).
+typedef struct { int64_t start, end; int32_t type; } DmemRegion;
+int sceKernelDirectMemoryQuery(int64_t offset, int flags, DmemRegion *out, size_t size);
+
+// All the pool's free memory and how many allocated regions there are: against the largest free block it tells holes
+// from exhaustion. -1 when the regions cannot be read.
+static int64_t dmem_free_total(unsigned *regions) {
+    int64_t total = sceKernelGetDirectMemorySize(), taken = 0, offset = 0;
+    unsigned n = 0;
+    DmemRegion r;
+    while (offset < total && n < 1000000 && !sceKernelDirectMemoryQuery(offset, 1, &r, sizeof r) && r.end > offset)
+        taken += r.end - r.start, offset = r.end, n++;
+    *regions = n;
+    return n ? total - taken : -1;
+}
 
 static void memory_report(const char *when) {
     struct ps5_heap_stats h = {0};
@@ -53,12 +69,15 @@ static void memory_report(const char *when) {
     int64_t dphys = 0;
     int fr = sceKernelAvailableFlexibleMemorySize(&flex);
     (void)sceKernelAvailableDirectMemorySize(0, sceKernelGetDirectMemorySize(), 0, &dphys, &dfree);
+    unsigned regions = 0;
+    int64_t ftotal = dmem_free_total(&regions);
     fprintf(stderr,
             "[host] ps5: memory %s: heap range %#llx+%#llx, mapped %.1f MiB (peak %.1f), in use %.1f MiB, %u segments, "
-            "%u arenas, %llu libc fallbacks; flexible free %.1f MiB (%d); direct memory: largest free %.1f MiB at %.1f s\n",
+            "%u arenas, %llu libc fallbacks; flexible free %.1f MiB (%d); direct memory: largest free %.1f MiB at %.1f s, "
+            "free %.1f MiB in all, %u regions allocated\n",
             when, (unsigned long long)h.range_base, (unsigned long long)h.range_bytes, h.mapped_bytes / 1048576.0,
             h.peak_bytes / 1048576.0, h.in_use_bytes / 1048576.0, h.segments, h.arenas, h.libc_fallbacks,
-            flex / 1048576.0, fr, dfree / 1048576.0, plat_process_uptime_ns() / 1e9);
+            flex / 1048576.0, fr, dfree / 1048576.0, plat_process_uptime_ns() / 1e9, ftotal / 1048576.0, regions);
     char st[900];
     if (ps5_mem_stats(st, sizeof st) > 0) fprintf(stderr, "[host] ps5: memory %s: %s\n", when, st);
 }
@@ -218,7 +237,7 @@ static void dump_watch(void *arg) {
     (void)arg;
     for (int n = 1, tick = 0;; ) {
         plat_sleep_ms(2000);
-        if (++tick % 30 == 0) memory_report("every 60 s");   // the memory budget while the game runs (Step 4)
+        if (++tick % 15 == 0) memory_report("every 30 s");   // the memory budget while the game runs (Step 4)
         if (access(DUMP_TRIGGER, F_OK)) continue;
         // The trigger's text, if any: "<count> <interval_ms> <thread name>" samples that thread alone (a profile).
         char req[128] = "", name[64] = "";
