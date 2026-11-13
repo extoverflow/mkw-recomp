@@ -6,17 +6,19 @@ calls layout() and writes the result into generated/<version>/layout.h and layou
 build read.
 
 Modules are placed in Horizon's load order (rtld is dropped; the host links the modules):
-main, subsdk0..9, sdk. Each base is aligned to 2 MiB. Everything must stay below 2^39, the limit of the addresses
-IPC buffers can encode.
+main, subsdk0..9, sdk. Each base is aligned to 2 MiB. Everything must stay below 2^38 (host.h RT_ADDRESS_LIMIT;
+IPC buffers can encode up to 2^39): a PS5 title has RADV at 0x2_0000_0000-0x3_0000_0000 and
+0x40_0000_0000-0x80_0000_0000, so the modules start at 0x30_0000_0000, above the heap block and its alias
+(runtime/core/memory/memory.c), on every host alike.
 """
 import json
 from pathlib import Path
 
 from nso import Nso
 
-FIRST_BASE = 0x7000000000
+FIRST_BASE = 0x3000000000
 ALIGN = 0x200000
-ADDRESS_LIMIT = 1 << 39
+ADDRESS_LIMIT = 1 << 38
 ORDER = ['main'] + [f'subsdk{i}' for i in range(10)] + ['sdk']
 
 
@@ -36,7 +38,7 @@ def layout(exefs):
         out.append((name, base, size))
         base = align_up(base + size)
     if base > ADDRESS_LIMIT:
-        raise ValueError(f'modules end at {base:#x}, above 2^39')
+        raise ValueError(f'modules end at {base:#x}, above 2^38')
     return out
 
 
