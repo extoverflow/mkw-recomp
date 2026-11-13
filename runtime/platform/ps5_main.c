@@ -13,8 +13,9 @@
 #include <unistd.h>
 
 #include "platform.h"
+#include "ps5_int.h"
 
-#define PS5_DIR "/data/mkw-recomp"
+#define PS5_DIR PS5_DATA_DIR
 #define ARGS PS5_DIR "/args.txt"
 #define LOG PS5_DIR "/mkw.log"
 #define MAX_ARGS 64
@@ -27,6 +28,33 @@ int sceSystemServiceHideSplashScreen(void);
 int sceSystemServiceLoadExec(const char *path, const char *const *argv);
 int sceKernelUsleep(uint32_t microseconds);
 static int log_fds[2];
+
+// The platform heap every malloc goes to (PS5_Vulkan's link recipe wraps malloc into it: ps5platform/heap.h of the
+// SDK fork's platform layer, ref/PS5_PayloadSDK/platform/include/ps5platform/heap.h:54-79) and the flexible memory
+// left: logged at the start and at the exit, to see what a run used.
+struct ps5_heap_stats {
+    uintptr_t range_base;
+    size_t range_bytes, mapped_bytes, peak_bytes;
+    unsigned segments;
+    unsigned long long libc_fallbacks;
+    unsigned arenas;
+    size_t in_use_bytes;
+};
+void ps5_heap_stats(struct ps5_heap_stats *stats);
+int sceKernelAvailableFlexibleMemorySize(size_t *size);
+
+static void memory_report(const char *when) {
+    struct ps5_heap_stats h = {0};
+    ps5_heap_stats(&h);
+    size_t flex = 0;
+    int fr = sceKernelAvailableFlexibleMemorySize(&flex);
+    fprintf(stderr,
+            "[host] ps5: memory %s: heap range %#llx+%#llx, mapped %.1f MiB (peak %.1f), in use %.1f MiB, %u segments, "
+            "%u arenas, %llu libc fallbacks; flexible free %.1f MiB (%d)\n",
+            when, (unsigned long long)h.range_base, (unsigned long long)h.range_bytes, h.mapped_bytes / 1048576.0,
+            h.peak_bytes / 1048576.0, h.in_use_bytes / 1048576.0, h.segments, h.arenas, h.libc_fallbacks,
+            flex / 1048576.0, fr);
+}
 
 // Descriptors 1 and 2, and so the streams stdout and stderr, go to LOG. A title may not dup2 (the console refuses it
 // with EPERM: ref/PS5_PayloadSDK/platform/src/klog.c:86-87; title run 2 saw it too), so 1 and 2 are closed and the
@@ -53,6 +81,7 @@ static int log_open(void) {
 // Asks the shell to close the title and waits for it (the template's catchReturnFromMain). The C runtime calls it after
 // main returns; plat_exit (ps5_sys.c) calls it too.
 void catchReturnFromMain(int status) {
+    memory_report("at exit");
     fprintf(stderr, "[host] exit status %d: asking the shell to close the title\n", status);
     fflush(NULL);
     int r = sceSystemServiceLoadExec("exit", NULL);
@@ -116,6 +145,41 @@ static int tone_test(int seconds) {
     return 0;
 }
 
+// --ps5-list-test DIR: what a directory listing gives in a title (dirfd, fstatat and lstat of the first entries).
+#include <dirent.h>
+#include <errno.h>
+#include <sys/stat.h>
+static int list_test(const char *dir) {
+    DIR *d = opendir(dir);
+    printf("ps5-list-test: opendir(%s) = %p errno %d\n", dir, (void *)d, d ? 0 : errno);
+    if (!d) return 1;
+    int fd = dirfd(d), shown = 0;
+    printf("ps5-list-test: dirfd = %d\n", fd);
+    for (struct dirent *e; (e = readdir(d)) && shown < 4;) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        struct stat a, b;
+        errno = 0;
+        int ra = fstatat(fd, e->d_name, &a, AT_SYMLINK_NOFOLLOW), ea = errno;
+        char path[4096];
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        errno = 0;
+        int rb = lstat(path, &b), eb = errno;
+        struct stat c, f;
+        errno = 0;
+        int rc = stat(path, &c), ec = errno;
+        int ofd = open(path, O_RDONLY), eo = errno, rf = ofd >= 0 ? fstat(ofd, &f) : -1;
+        if (ofd >= 0) close(ofd);
+        printf("ps5-list-test: %s: d_type %d; fstatat %d errno %d; lstat %d errno %d; stat %d errno %d mode %o size %lld; "
+               "open %d errno %d fstat %d mode %o size %lld\n",
+               e->d_name, e->d_type, ra, ea, rb, eb, rc, ec, rc ? 0 : c.st_mode, rc ? 0LL : (long long)c.st_size, ofd, ofd < 0 ? eo : 0,
+               rf, rf ? 0 : f.st_mode, rf ? 0LL : (long long)f.st_size);
+        (void)a, (void)b;
+        shown++;
+    }
+    closedir(d);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     // The SDK's stdio.h expands getc/putc/putchar/fileno/feof inline on FreeBSD's FILE layout unless __isthreaded is
@@ -154,8 +218,10 @@ int main(int argc, char **argv) {
             log_ok ? "on descriptors 1 and 2" : "NOT on 1 and 2", log_fds[0], log_fds[1], envs, n - 1, ARGS);
     for (int i = 1; i < n; i++) fprintf(stderr, " %s", args[i]);
     fputc('\n', stderr);
+    memory_report("at start");
     int status = n >= 2 && !strcmp(args[1], "--ps5-pad-test")    ? pad_test(n >= 3 ? atoi(args[2]) : 20)
                  : n >= 2 && !strcmp(args[1], "--ps5-tone-test") ? tone_test(n >= 3 ? atoi(args[2]) : 3)
+                 : n >= 3 && !strcmp(args[1], "--ps5-list-test") ? list_test(args[2])
                                                                   : mkw_main(n, args);
     fprintf(stderr, "[host] ps5: mkw_main returned %d\n", status);
     return status;

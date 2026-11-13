@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "platform.h"
+#include "ps5_int.h"
 
 // ---- files
 
@@ -240,9 +241,16 @@ static int fs_err(int e) {
     }
 }
 
+// lstat, as linux_fs.c uses it. A title may not lstat or fstatat (EPERM, 13/11/2026: stat and open+fstat work), and
+// in a title nothing can make a symlink (Gate 0: link and symlink fail on /data), so there stat answers the same.
+static int nofollow_stat(const char *path, struct stat *st) {
+    if (!lstat(path, st)) return 0;
+    return errno == EPERM ? stat(path, st) : -1;
+}
+
 int plat_fs_kind(const char *path) {
     struct stat st;
-    if (lstat(path, &st)) return PLAT_FS_MISSING;
+    if (nofollow_stat(path, &st)) return PLAT_FS_MISSING;
     return S_ISLNK(st.st_mode) ? PLAT_FS_LINK : S_ISDIR(st.st_mode) ? PLAT_FS_DIR : PLAT_FS_FILE;
 }
 
@@ -266,7 +274,7 @@ static int remove_entry(const char *path, int dir) {
 
 int plat_fs_rmdir(const char *path) {
     struct stat st;
-    if (!lstat(path, &st) && S_ISLNK(st.st_mode)) return remove_entry(path, 0);
+    if (!nofollow_stat(path, &st) && S_ISLNK(st.st_mode)) return remove_entry(path, 0);
     return remove_entry(path, 1);
 }
 
@@ -308,11 +316,27 @@ void plat_fs_busy_reason(const char *dir, char *out, size_t cap) {
 int plat_fs_list(const char *dir, int (*cb)(const char *name, int kind, uint64_t size, void *ctx), void *ctx) {
     DIR *d = opendir(dir);
     if (!d) return fs_err(errno);
+    // linux_fs.c fstatats each entry; a title may not (nofollow_stat): the kind comes from d_type where the file
+    // system gives it, the size of a file from a stat of its path.
+    char path[PATH_MAX];
+    size_t len = strlen(dir);
+    if (len + 2 >= sizeof path) {
+        closedir(d);
+        return PLAT_FS_ERROR;
+    }
+    memcpy(path, dir, len);
+    path[len++] = '/';
     for (struct dirent *e; (e = readdir(d));) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        size_t n = strlen(e->d_name);
+        if (len + n >= sizeof path) continue;
+        memcpy(path + len, e->d_name, n + 1);
+        int kind = e->d_type == DT_LNK ? PLAT_FS_LINK : e->d_type == DT_DIR ? PLAT_FS_DIR : PLAT_FS_FILE;
         struct stat st;
-        if (fstatat(dirfd(d), e->d_name, &st, AT_SYMLINK_NOFOLLOW)) continue;
-        int kind = S_ISLNK(st.st_mode) ? PLAT_FS_LINK : S_ISDIR(st.st_mode) ? PLAT_FS_DIR : PLAT_FS_FILE;
+        if (e->d_type == DT_UNKNOWN || kind == PLAT_FS_FILE) {
+            if (nofollow_stat(path, &st)) continue;
+            kind = S_ISLNK(st.st_mode) ? PLAT_FS_LINK : S_ISDIR(st.st_mode) ? PLAT_FS_DIR : PLAT_FS_FILE;
+        }
         if (!cb(e->d_name, kind, kind == PLAT_FS_FILE ? (uint64_t)st.st_size : 0, ctx)) break;
     }
     closedir(d);
@@ -348,7 +372,7 @@ int plat_file_set_size(PlatFile *f, uint64_t size) { return ftruncate(fd_of(f), 
 int plat_file_fsync(PlatFile *f) { return fsync(fd_of(f)) == 0; }
 
 // A title cannot write /tmp: TMPDIR, else a folder of ours under /data, made on first use.
-#define PS5_TEMP_DIR "/data/mkw-recomp/tmp"
+#define PS5_TEMP_DIR PS5_DATA_DIR "/tmp"
 
 int plat_temp_dir(char *out, size_t cap) {
     const char *t = getenv("TMPDIR");
