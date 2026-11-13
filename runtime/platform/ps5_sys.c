@@ -293,6 +293,14 @@ unsigned long long ZSTD_trace_decompress_begin(const void *dctx) {
 }
 void ZSTD_trace_decompress_end(unsigned long long ctx, const void *trace) { (void)ctx, (void)trace; }
 
+// setvbuf for the runtime (ps5_compat.h renames its calls): _IONBF on stdout or stderr becomes line buffering.
+#undef setvbuf
+int setvbuf(FILE *stream, char *buf, int mode, size_t size);   // stdio.h declared it under the macro's name
+int ps5_setvbuf(FILE *stream, char *buf, int mode, size_t size) {
+    if (mode == _IONBF && (stream == stdout || stream == stderr)) return setvbuf(stream, NULL, _IOLBF, 4096);
+    return setvbuf(stream, buf, mode, size);
+}
+
 // strdup and strndup inside the console's libc allocate from libc's own small private heap, which the title's link
 // does not redirect (PS5_Vulkan tools/radv-link.sh wraps malloc and its family into the platform heap in direct
 // memory, not the libc functions that allocate). The RomFS index's 206,202 names ran it out ("RomFS: loose index
