@@ -1254,6 +1254,8 @@ void vk_pipeline_save(void) {
 
 // The game never shuts the device down (boot.c and the window end the process), so the cache is saved while it
 // runs: at most every 20 s, and only after new pipelines were built. New pipeline keys are appended every 2 s.
+// On the PS5 a title may write ~1.3 GiB at full speed and then ~2 MiB/s: saves every 20 s spent it in ~20 min, so the
+// PS5 profile sets MKW_PIPE_AUTOSAVE_S to 600 (cfg.c).
 static void autosave_once(void) {
     static uint64_t last_n, last_ms, last_keys;
     if (!P.ready) return;
