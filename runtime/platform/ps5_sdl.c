@@ -66,6 +66,7 @@ enum {   // the console's button bits
 struct SDL_Gamepad {
     int32_t user, handle;         // handle -1: no controller
     bool connected, opened;       // opened: SDL_OpenGamepad gave it out and SDL_CloseGamepad has not taken it back
+    uint64_t reopen_at;           // users_scan: when a disconnected pad may be opened again (every 5 s at most)
     struct pad_sample last;       // the latest reading the title may use (neutral while the shell has the pad)
     uint64_t rumble_until_ns;     // 0: not rumbling
 };
@@ -81,16 +82,17 @@ static void pad_rest(SDL_Gamepad *g) {
 
 static void pad_read(SDL_Gamepad *g) {
     static struct pad_sample s[64];
+    bool was = g->connected;
     int n = scePadRead(g->handle, s, 64);
-    if (n < 0) {
-        g->connected = false;
-        return;
-    }
+    if (n < 0) g->connected = false;
     for (int i = 0; i < n && i < 64; i++) {
         g->connected = s[i].connected != 0;
         if (!g->connected || (s[i].buttons & INTERCEPTED)) pad_rest(g);
         else g->last = s[i];
     }
+    if (g->connected != was)
+        rt_log("input: ps5: pad of user %d %s (handle %d%s)", (int)g->user, g->connected ? "connected" : "disconnected",
+               (int)g->handle, n < 0 ? ", read failed" : "");
 }
 
 static bool player_open(int p, int32_t user, int attempts) {
@@ -118,10 +120,26 @@ static void player_close(int p) {
     g->handle = g->user = -1, g->connected = g->opened = false;
 }
 
+static bool player_open(int p, int32_t user, int attempts);
+
 // The signed-in users again: a user who signed out lets their controller go, a new one's takes the first free slot.
+// A signed-in user's pad that reads as disconnected is opened again: a handle stays with the controller it was opened
+// on, and a new one (a Remote Play session started again, a controller paired again) is only reached by a new open
+// (13/11/2026: after a Remote Play restart the game had no controller until the title restarted).
 static void users_scan(void) {
     struct user_list list = {{-1, -1, -1, -1}};
     if (sceUserServiceGetLoginUserIdList(&list) < 0) return;
+    for (int p = 0; p < PLAYERS; p++) {
+        SDL_Gamepad *g = &g_pads[p];
+        if (g->handle < 0 || g->connected || plat_now_ns() < g->reopen_at) continue;
+        g->reopen_at = plat_now_ns() + 5 * SCAN_NS;
+        int32_t user = g->user;
+        bool opened = g->opened;
+        scePadClose(g->handle);
+        g->handle = -1;
+        if (player_open(p, user, 1)) g->opened = opened;   // the game's open SDL_Gamepad keeps working
+        else g->user = user, g->connected = false;          // tried again at the next scan
+    }
     for (int p = 0; p < PLAYERS; p++) {
         if (g_pads[p].handle < 0) continue;
         bool in = false;
