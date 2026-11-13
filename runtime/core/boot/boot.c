@@ -6,7 +6,9 @@
 // --boot ends at the first nvnBootstrapLoader call (from main+0xcf3a5c in MKW 1.0.0), after every module's
 // constructor flag read 2; it logs the run statistics and exits 0.
 // With --seconds S the run continues past that call; rt_frame_presented ends it once the world clock passed S.
+#ifndef __PROSPERO__   // the PS5 has no SDL: the message goes to the log only
 #include <SDL3/SDL_messagebox.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -368,7 +370,9 @@ static void lock_profile(void) {
     snprintf(p, sizeof p, "%s/instance.lock", rt_config()->profile_base);
     if (plat_file_lock(p)) return;   // -1 (cannot open it): played as before, without the guard
     const char *msg = "Mario Kart World is already running from this folder. Close it before starting it again.";
+#ifndef __PROSPERO__
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "mkw-recomp", msg, NULL);
+#endif
     rt_fatal("boot: %s (%s is held)", msg, p);
 }
 

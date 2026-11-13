@@ -1,0 +1,515 @@
+// PS5 implementation of platform.h: threads, thread interruption, fibers, affinity and priorities. linux.c
+// (8cbbfe1) on the payload SDK's FreeBSD libthr, with one change of substance: stacks. In a PS5 title every anonymous
+// mapping, even an inaccessible one, counts against the ~442 MiB flexible-memory budget (Gate 0), and the runtime asks
+// for 256 MiB per guest thread and fiber (HOST_STACK) and 16 MiB per runtime thread. So stacks are direct memory,
+// committed, sized to what the threads use on Linux with a wide margin (measured 2026-11-12: guest stacks at most
+// 84 KiB deep, runtime threads 212 KiB), below each an unmapped guard. Code map and divergences:
+// kept outside this repo.
+#include <errno.h>
+#include <pthread.h>
+#include <pthread_np.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/cpuset.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+#include "platform.h"
+#include "ps5_int.h"
+
+int64_t sceKernelGetDirectMemorySize(void);
+int32_t sceKernelAllocateDirectMemory(int64_t start, int64_t end, size_t len, size_t align, int type,
+                                     int64_t *phys_out);
+int32_t sceKernelReleaseDirectMemory(int64_t start, size_t len);
+int32_t sceKernelMapDirectMemory(void **addr, size_t len, int prot, int flags, int64_t phys, size_t align);
+int32_t sceKernelReserveVirtualRange(void **addr, size_t len, int flags, size_t align);
+
+// ---- stacks
+#define PS5_PAGE 0x4000u                 // the kernel's page (Gate 0)
+#define STACK_GUARD (64u << 10)          // reserved, never mapped: an overflow faults instead of writing a neighbour
+#define STACK_GUEST_MIN (64u << 20)      // a request this large is HOST_STACK (256 MiB): a guest thread or fiber
+#define STACK_GUEST_KIB 2048u            // MKW_PS5_STACK_GUEST_KIB overrides: 24x the deepest guest stack measured
+#define STACK_KIB 1024u                  // MKW_PS5_STACK_KIB overrides: 5x the deepest runtime stack measured
+#define STACK_FILL 0x21355350214b5453ull // "STK!PS5!": what an untouched word of a stack still holds (depth report)
+#define STACK_MAX 4096                   // stacks tracked for the report and the free list
+#define STACK_REUSE_NS 100000000u        // a detached thread's stack is reused this long after its thread ended
+
+typedef struct Ps5Stack {
+    uint8_t *base;      // the reservation: guard, then the stack
+    size_t size;        // the stack's bytes, above the guard
+    int64_t phys;       // the direct memory behind it; -1: anonymous memory (no direct memory here: a payload)
+    int kind;           // 0 runtime thread, 1 guest thread or fiber
+    int in_use;
+    pthread_t owner;    // the detached thread that last ran on it, until it is gone
+    uint64_t freed_ns;  // when it was put back; 0 while in use
+} Ps5Stack;
+
+static Ps5Stack stacks[STACK_MAX];
+static int nstacks, stack_direct = -1;   // -1 untried, 1 direct memory works, 0 it does not (anonymous instead)
+static PlatMutex stack_lock = PLAT_MUTEX_INIT;
+
+static size_t env_kib(const char *name, size_t def) {
+    const char *v = getenv(name);
+    long k = v ? atol(v) : 0;
+    return (k > 0 ? (size_t)k : def) << 10;
+}
+
+// The bytes to commit for a request of want: guest-sized requests get the guest size, the others the runtime size but
+// never more than they asked for (a small helper thread's 64 KiB stays 64 KiB). Whole kernel pages.
+static size_t stack_bytes(size_t want, int *kind) {
+    *kind = want >= STACK_GUEST_MIN;
+    size_t n = *kind ? env_kib("MKW_PS5_STACK_GUEST_KIB", STACK_GUEST_KIB) : env_kib("MKW_PS5_STACK_KIB", STACK_KIB);
+    if (!*kind && want && want < n) n = want;
+    if (n < 4 * PS5_PAGE) n = 4 * PS5_PAGE;
+    return (n + PS5_PAGE - 1) & ~(size_t)(PS5_PAGE - 1);
+}
+
+// A new stack: an address range reserved (guard + stack, sceKernelReserveVirtualRange: not flexible memory) and direct
+// memory mapped over its top part; where there is no direct memory to have (a payload: 0 MiB), anonymous memory with
+// the guard made inaccessible. The words are filled with STACK_FILL for the depth report.
+static int stack_map(Ps5Stack *s, size_t size) {
+    size_t total = size + STACK_GUARD;
+    void *base = NULL;
+    s->phys = -1;
+    if (stack_direct != 0 && !sceKernelReserveVirtualRange(&base, total, 0, PS5_PAGE)) {
+        int64_t phys = 0;
+        void *top = (uint8_t *)base + STACK_GUARD;
+        if (!sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, PS5_PAGE, 12, &phys)) {
+            if (!sceKernelMapDirectMemory(&top, size, PROT_READ | PROT_WRITE, MAP_FIXED, phys, PS5_PAGE) &&
+                top == (uint8_t *)base + STACK_GUARD)
+                s->phys = phys;
+            else
+                sceKernelReleaseDirectMemory(phys, size);
+        }
+        if (s->phys < 0) munmap(base, total), base = NULL;
+        if (stack_direct < 0) stack_direct = s->phys >= 0;
+    }
+    if (!base) {
+        base = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (base == MAP_FAILED) return 0;
+        mprotect(base, STACK_GUARD, PROT_NONE);
+    }
+    s->base = base, s->size = size;
+    uint64_t *w = (uint64_t *)(s->base + STACK_GUARD);
+    for (size_t i = 0; i < size / 8; i++) w[i] = STACK_FILL;
+    return 1;
+}
+
+// A stack for a thread or fiber that asked for want bytes: a free one of the same size, else a new one. NULL when the
+// memory is gone.
+static size_t stack_depth(const Ps5Stack *s);
+
+static Ps5Stack *stack_get(size_t want) {
+    int kind;
+    size_t size = stack_bytes(want, &kind);
+    uint64_t now = plat_now_ns();
+    plat_mutex_lock(&stack_lock);
+    Ps5Stack *s = NULL;
+    for (int i = 0; i < nstacks && !s; i++) {
+        Ps5Stack *c = &stacks[i];
+        if (c->in_use || c->size != size || now - c->freed_ns < STACK_REUSE_NS) continue;
+        if (c->owner && pthread_kill(c->owner, 0) != ESRCH) continue;   // its thread is still finishing on it
+        s = c;
+    }
+    if (!s && nstacks < STACK_MAX) {
+        s = &stacks[nstacks];
+        if (stack_map(s, size)) nstacks++;
+        else s = NULL;
+    }
+    if (s) {
+        if (s->freed_ns) {   // used before: refilled where it was used, so the report measures each user afresh
+            size_t used = stack_depth(s);
+            uint64_t *w = (uint64_t *)(s->base + STACK_GUARD + s->size - used);
+            for (size_t i = 0; i < used / 8; i++) w[i] = STACK_FILL;
+        }
+        s->in_use = 1, s->kind = kind, s->owner = 0, s->freed_ns = 0;
+    }
+    plat_mutex_unlock(&stack_lock);
+    return s;
+}
+
+// Back to the free list. owner: the thread still running on it as it ends (detached), else 0.
+static void stack_put(Ps5Stack *s, pthread_t owner) {
+    plat_mutex_lock(&stack_lock);
+    s->owner = owner, s->freed_ns = plat_now_ns(), s->in_use = 0;
+    plat_mutex_unlock(&stack_lock);
+}
+
+static size_t stack_depth(const Ps5Stack *s) {
+    const uint64_t *w = (const uint64_t *)(s->base + STACK_GUARD);
+    size_t i = 0;
+    while (i < s->size / 8 && w[i] == STACK_FILL) i++;
+    return s->size - i * 8;
+}
+
+int ps5_stack_report(char *out, size_t cap, int each) {
+    size_t deepest[2] = {0, 0}, size[2] = {0, 0};
+    int n[2] = {0, 0}, k = 0, anon = 0;
+    plat_mutex_lock(&stack_lock);
+    for (int i = 0; i < nstacks; i++) {
+        size_t d = stack_depth(&stacks[i]);
+        int kind = stacks[i].kind;
+        n[kind]++, size[kind] = stacks[i].size, anon += stacks[i].phys < 0;
+        if (d > deepest[kind]) deepest[kind] = d;
+        if (each && (size_t)k < cap)
+            k += snprintf(out + k, cap - (size_t)k, "stack %d: %s, %zu of %zu KiB used, %s, at %p\n", i,
+                          kind ? "guest" : "runtime", d >> 10, stacks[i].size >> 10,
+                          stacks[i].phys >= 0 ? "direct memory" : "anonymous", (void *)(stacks[i].base + STACK_GUARD));
+    }
+    plat_mutex_unlock(&stack_lock);
+    if ((size_t)k < cap)
+        k += snprintf(out + k, cap - (size_t)k,
+                      "stacks: %d guest, deepest %zu of %zu KiB; %d runtime, deepest %zu of %zu KiB; %d in direct "
+                      "memory, %d anonymous\n", n[1], deepest[1] >> 10, size[1] >> 10, n[0], deepest[0] >> 10,
+                      size[0] >> 10, n[0] + n[1] - anon, anon);
+    return k;
+}
+
+// ---- threads
+
+struct PlatThread {
+    pthread_t t;
+    PlatThreadFn fn;
+    void *arg;
+    Ps5Stack *stack;
+    volatile int detached;   // set by plat_thread_detach: the thread puts its own stack back as it ends
+    int prio;
+    char name[32];
+};
+
+static __thread int my_prio;
+
+// A signal stack for the calling thread, so the fault and crash handlers still run when its own stack is exhausted
+// (linux.c's alt_stack). 64 KiB of anonymous memory each: small enough for the flexible budget.
+void alt_stack(void) {
+    stack_t cur;
+    if (!sigaltstack(NULL, &cur) && !(cur.ss_flags & SS_DISABLE)) return;
+    size_t size = 64 << 10;
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) return;
+    stack_t ss = {.ss_sp = p, .ss_size = size};
+    sigaltstack(&ss, NULL);
+}
+
+static void *thread_main(void *p) {
+    PlatThread *t = p;
+    alt_stack();
+    if (t->name[0]) pthread_set_name_np(pthread_self(), t->name);
+    t->fn(t->arg);
+    // Detached: nobody joins, so the thread hands its stack back itself; stack_get reuses it only once this thread is
+    // gone (pthread_kill reports ESRCH) and STACK_REUSE_NS has passed.
+    if (__atomic_load_n(&t->detached, __ATOMIC_ACQUIRE)) stack_put(t->stack, pthread_self());
+    return NULL;
+}
+
+PlatThread *plat_thread_new(PlatThreadFn fn, void *arg, const char *name) {
+    return plat_thread_new_ex(fn, arg, name, 0);
+}
+
+PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, size_t stack) {
+    PlatThread *t = calloc(1, sizeof *t);
+    if (!t) return NULL;
+    t->fn = fn;
+    t->arg = arg;
+    if (name) snprintf(t->name, sizeof t->name, "%s", name);
+    t->stack = stack_get(stack ? stack : PLAT_STACK_DEFAULT);
+    if (!t->stack) {
+        free(t);
+        return NULL;
+    }
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstack(&a, t->stack->base + STACK_GUARD, t->stack->size);
+    int e = pthread_create(&t->t, &a, thread_main, t);
+    pthread_attr_destroy(&a);
+    if (e) {
+        stack_put(t->stack, 0);
+        free(t);
+        return NULL;
+    }
+    return t;
+}
+
+int plat_thread_spawn(PlatThreadFn fn, void *arg, const char *name, size_t stack) {
+    PlatThread *t = plat_thread_new_ex(fn, arg, name, stack);
+    if (t) plat_thread_detach(t);
+    return t != NULL;
+}
+
+void plat_thread_join(PlatThread *t) {
+    pthread_join(t->t, NULL);
+    stack_put(t->stack, 0);
+    free(t);
+}
+
+int plat_thread_join_ns(PlatThread *t, uint64_t ns) {
+    struct timespec at;
+    clock_gettime(CLOCK_REALTIME, &at);   // pthread_timedjoin_np takes a CLOCK_REALTIME deadline, as on Linux
+    uint64_t end = (uint64_t)at.tv_sec * 1000000000u + (uint64_t)at.tv_nsec + ns;
+    at.tv_sec = (time_t)(end / 1000000000u), at.tv_nsec = (long)(end % 1000000000u);
+    if (pthread_timedjoin_np(t->t, NULL, &at)) return 0;
+    stack_put(t->stack, 0);
+    free(t);
+    return 1;
+}
+
+// The thread keeps using t (fn, arg, its stack), so the struct stays allocated, as on Linux.
+void plat_thread_detach(PlatThread *t) {
+    __atomic_store_n(&t->detached, 1, __ATOMIC_RELEASE);
+    pthread_detach(t->t);
+}
+
+// ---- processors. No /sys topology on the console: the processors the process may use come from its cpuset, and the
+// two logical processors of a core are taken to be 2k and 2k+1 (Zen 2's numbering). The kernel takes a set of at most
+// 16 bytes: the SDK's cpuset_t is 32, which it refuses with ERANGE (thread_test, 13/11/2026), so every call passes
+// PS5_CPUSET_BYTES.
+#define PS5_CPUSET_BYTES 16
+static int cpuset_mask(uint64_t *mask) {
+    cpuset_t set;
+    CPU_ZERO(&set);
+    if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, PS5_CPUSET_BYTES, &set)) return 0;
+    *mask = 0;
+    for (int i = 0; i < 64; i++)
+        if (CPU_ISSET(i, &set)) *mask |= 1ull << i;
+    return 1;
+}
+
+int plat_cpu_cores(uint64_t *all, uint64_t *first) {
+    *all = *first = 0;
+    if (!cpuset_mask(all)) return 0;
+    int cores = 0;
+    for (int i = 0; i < 64; i += 2)
+        if (*all >> i & 3) *first |= 1ull << (*all >> i & 1 ? i : i + 1), cores++;
+    return cores;
+}
+
+int plat_process_affinity(uint64_t mask) {
+    cpuset_t set;
+    CPU_ZERO(&set);
+    for (int i = 0; i < 64; i++)
+        if (mask >> i & 1) CPU_SET(i, &set);
+    return cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, PS5_CPUSET_BYTES, &set) == 0;
+}
+
+uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) {
+    pthread_t th = t ? t->t : pthread_self();
+    cpuset_t old, set;
+    CPU_ZERO(&old);
+    if (pthread_getaffinity_np(th, PS5_CPUSET_BYTES, &old)) return 0;
+    CPU_ZERO(&set);
+    for (int i = 0; i < 64; i++)
+        if (mask >> i & 1) CPU_SET(i, &set);
+    if (pthread_setaffinity_np(th, PS5_CPUSET_BYTES, &set)) return 0;
+    uint64_t prev = 0;
+    for (int i = 0; i < 64; i++)
+        if (CPU_ISSET(i, &old)) prev |= 1ull << i;
+    return prev;
+}
+
+uint32_t plat_cpu_count(void) {
+    uint64_t m = 0;
+    if (cpuset_mask(&m) && m) return (uint32_t)__builtin_popcountll(m);
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (uint32_t)n : 1;
+}
+
+uint64_t plat_self_cpu_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+// Another thread's CPU time: /proc on Linux; the SDK has no clock_getcpuclockid2. Unknown.
+uint64_t plat_thread_cpu_ns(uint32_t tid) {
+    (void)tid;
+    return 0;
+}
+
+// ---- thread interruption: linux.c's signal handshake. SIGUSR1, the signal Gate 0 measured (10,000 stops, mean 12 us);
+// the registers through FreeBSD's mcontext (the SDK fork's headers have the PS5's layout, Gate 0).
+enum { INTR_IDLE, INTR_REQ, INTR_STOPPED, INTR_GO };
+#define INTR_WAIT_NS 200000u
+#define INTR_SIG SIGUSR1
+
+struct PlatIntr {
+    pthread_t pt;
+    volatile int32_t state;
+    uint64_t rip, rsp, to;
+};
+
+static __thread PlatIntr *intr_me;
+static int intr_sig;
+
+static void intr_handler(int sig, siginfo_t *si, void *uc) {
+    (void)sig, (void)si;
+    PlatIntr *t = intr_me;
+    ucontext_t *u = uc;
+    if (!t) return;
+    t->rip = (uint64_t)u->uc_mcontext.mc_rip;
+    t->rsp = (uint64_t)u->uc_mcontext.mc_rsp;
+    int32_t req = INTR_REQ;
+    if (!__atomic_compare_exchange_n(&t->state, &req, INTR_STOPPED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+    while (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) != INTR_GO) plat_pause();
+    if (t->to) u->uc_mcontext.mc_rip = (__register_t)t->to;
+    __atomic_store_n(&t->state, INTR_IDLE, __ATOMIC_RELEASE);
+}
+
+PlatIntr *plat_intr_self(void) {
+    static PlatMutex install = PLAT_MUTEX_INIT;
+    if (!__atomic_load_n(&intr_sig, __ATOMIC_ACQUIRE)) {
+        plat_mutex_lock(&install);
+        if (!intr_sig) {
+            struct sigaction sa = {.sa_sigaction = intr_handler, .sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK};
+            sigemptyset(&sa.sa_mask);
+            if (!sigaction(INTR_SIG, &sa, NULL)) __atomic_store_n(&intr_sig, INTR_SIG, __ATOMIC_RELEASE);
+        }
+        plat_mutex_unlock(&install);
+    }
+    if (!intr_sig) return NULL;
+    PlatIntr *t = calloc(1, sizeof *t);
+    if (!t) return NULL;
+    t->pt = pthread_self();
+    intr_me = t;
+    return t;
+}
+
+void plat_intr_free(PlatIntr *t) {
+    if (!t) return;
+    if (intr_me == t) intr_me = NULL;
+    free(t);
+}
+
+int plat_intr_stop(PlatIntr *t, uint64_t *rip, uint64_t *rsp) {
+    int32_t idle = INTR_IDLE;
+    if (!__atomic_compare_exchange_n(&t->state, &idle, INTR_REQ, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
+    if (pthread_kill(t->pt, intr_sig)) {
+        __atomic_store_n(&t->state, INTR_IDLE, __ATOMIC_RELEASE);
+        return 0;
+    }
+    uint64_t end = plat_now_ns() + INTR_WAIT_NS;
+    while (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) != INTR_STOPPED) {
+        if (plat_now_ns() < end) {
+            plat_pause();
+            continue;
+        }
+        int32_t req = INTR_REQ;
+        if (__atomic_compare_exchange_n(&t->state, &req, INTR_IDLE, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
+    }
+    *rip = t->rip;
+    *rsp = t->rsp;
+    return 1;
+}
+
+int plat_intr_resume(PlatIntr *t, uint64_t to) {
+    t->to = to;
+    __atomic_store_n(&t->state, INTR_GO, __ATOMIC_RELEASE);
+    return 1;
+}
+
+// ---- fibers: linux.c's own stack switch, x86-64 only (the PS5's CPU). The stacks come from stack_get like a thread's.
+struct PlatFiber {
+    void *sp;
+    Ps5Stack *stack;   // NULL for a thread's own context
+};
+
+void plat_fiber_swap(void **save, void *load);
+void plat_fiber_entry(void);
+__asm__(".text\n"
+        ".globl plat_fiber_swap\n"
+        ".type plat_fiber_swap, @function\n"
+        ".p2align 4\n"
+        "plat_fiber_swap:\n"
+        "    .cfi_startproc\n"
+        "    pushq %rbp\n"
+        "    pushq %rbx\n"
+        "    pushq %r12\n"
+        "    pushq %r13\n"
+        "    pushq %r14\n"
+        "    pushq %r15\n"
+        "    subq $16, %rsp\n"
+        "    stmxcsr 8(%rsp)\n"
+        "    fnstcw (%rsp)\n"
+        "    movq %rsp, (%rdi)\n"
+        "    movq %rsi, %rsp\n"
+        "    fldcw (%rsp)\n"
+        "    ldmxcsr 8(%rsp)\n"
+        "    addq $16, %rsp\n"
+        "    popq %r15\n"
+        "    popq %r14\n"
+        "    popq %r13\n"
+        "    popq %r12\n"
+        "    popq %rbx\n"
+        "    popq %rbp\n"
+        "    ret\n"
+        "    .cfi_endproc\n"
+        ".size plat_fiber_swap, .-plat_fiber_swap\n"
+        ".globl plat_fiber_entry\n"
+        ".type plat_fiber_entry, @function\n"
+        ".p2align 4\n"
+        "plat_fiber_entry:\n"
+        "    movq %r13, %rdi\n"
+        "    andq $-16, %rsp\n"   // the ret here left it 8 off; SysV wants 16 before the call (NX2navi e9edd6a)
+        "    callq *%r12\n"
+        "    ud2\n"
+        ".size plat_fiber_entry, .-plat_fiber_entry\n");
+
+static __thread PlatFiber *fiber_cur;
+static __thread PlatFiber fiber_own;
+
+PlatFiber *plat_fiber_self(void) {
+    fiber_own = (PlatFiber){0};
+    fiber_cur = &fiber_own;
+    return &fiber_own;
+}
+
+void plat_fiber_unself(void) { fiber_cur = NULL; }
+
+PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
+    PlatFiber *f = calloc(1, sizeof *f);
+    if (!f) return NULL;
+    f->stack = stack_get(stack);
+    if (!f->stack) {
+        free(f);
+        return NULL;
+    }
+    uint64_t *top = (uint64_t *)(((uintptr_t)f->stack->base + STACK_GUARD + f->stack->size) & ~(uintptr_t)15);
+    uint64_t *sp = top - 10;   // fpu state (2 words), r15, r14, r13, r12, rbx, rbp, return address, padding
+    sp[0] = 0x037f;            // x87 control word: the default
+    sp[1] = 0x1f80;            // MXCSR: the default
+    sp[2] = sp[3] = 0;         // r15, r14
+    sp[4] = (uint64_t)(uintptr_t)arg;   // r13
+    sp[5] = (uint64_t)(uintptr_t)fn;    // r12
+    sp[6] = sp[7] = 0;         // rbx, rbp
+    sp[8] = (uint64_t)(uintptr_t)plat_fiber_entry;
+    sp[9] = 0;
+    f->sp = sp;
+    return f;
+}
+
+void plat_fiber_switch(PlatFiber *to) {
+    PlatFiber *from = fiber_cur;
+    fiber_cur = to;   // on this thread; the switch back into from sets it on whichever thread that is
+    plat_fiber_swap(&from->sp, to->sp);
+}
+
+void plat_fiber_free(PlatFiber *f) {
+    if (!f) return;
+    if (f->stack) stack_put(f->stack, 0);   // nobody runs it: free at once
+    free(f);
+}
+
+// ---- priorities: remembered, not applied. Linux applies them only with the right to raise a priority again; the PS5's
+// own thread priorities (scePthreadSetprio) are a later step.
+void plat_thread_priority(int prio) { my_prio = prio; }
+
+void plat_thread_set_priority(PlatThread *t, int prio) { t->prio = prio; }
+
+int plat_thread_priority_get(void) { return my_prio; }
+
+void plat_yield(void) { sched_yield(); }
