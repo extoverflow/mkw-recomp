@@ -518,8 +518,20 @@ int cfg_reload_key(const char *name) {
 static const struct { const char *key, *value; } DECK[] = {
     {"FULLSCREEN", "1"}, {"WINDOW_SIZE", "1280x800"}, {"VK_PRESENT", "fifo"}, {"RESOLUTION", "720"},
 };
-static int profile = -1;   // 0 none, 1 Steam Deck
+// The PS5 title (__PROSPERO__ builds), measured on the console 13/11/2026 (runs 20-27; the port's PS5
+// code, GPL-3.0-or-later): emulated mesh shaders hung the GPU (MESH_COMPUTE); upstream's one pipeline
+// worker under 14 GiB left draws waiting (PIPE_WORKERS); a sparse resource maps its whole span on PS5 RADV, one of the
+// title's 16,384 CPU page tables per 2 MiB, and the two terrain arrays used them all up (SPARSE_IMAGES, TEX_MAX as on
+// Turnip: vk_tex_image.c); fast-linked library pipelines drew without a vertex stage (radv_get_vgt_shader_key read
+// 0x199: GPL); the title owns its 12 GiB pool, where 4096 MiB (the integrated-GPU default) is a Linux desktop's share
+// (GPU_MEM_LIMIT).
+static const struct { const char *key, *value; } PS5[] = {
+    {"MESH_COMPUTE", "1"}, {"PIPE_WORKERS", "4"}, {"SPARSE_IMAGES", "0"}, {"TEX_MAX", "1024"}, {"GPL", "0"},
+    {"GPU_MEM_LIMIT", "6144"},
+};
+static int profile = -1;   // 0 none, 1 Steam Deck, 2 PS5
 
+#ifndef __PROSPERO__   // the PS5 title takes its own profile (profile_of)
 static int read_line(const char *path, char *out, size_t n) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
@@ -538,6 +550,7 @@ static int on_steam_deck(void) {
            read_line("/sys/class/dmi/id/product_name", product, sizeof product) &&
            (!strcmp(product, "Jupiter") || !strcmp(product, "Galileo"));
 }
+#endif
 
 static const char *raw_get(const char *name);
 
@@ -546,8 +559,13 @@ static int profile_of(void) {
     if (p >= 0) return p;
     const char *set = raw_get(PREFIX "DEVICE_PROFILE");
     if (set && !strcmp(set, "deck")) p = 1;
+    else if (set && !strcmp(set, "ps5")) p = 2;
     else if (set && *set && strcmp(set, "auto")) p = 0;
+#ifdef __PROSPERO__
+    else p = 2;
+#else
     else p = on_steam_deck();
+#endif
     __atomic_store_n(&profile, p, __ATOMIC_RELEASE);
     return p;
 }
@@ -606,9 +624,13 @@ const char *cfg_video_failed(const char *err, char *out, int size) {
 const char *cfg_get(const char *name) {
     const char *v = raw_get(name);
     if (v || strncmp(name, PREFIX, PREFIX_LEN)) return v;
-    if (profile_of()) {
+    int p = profile_of();
+    if (p == 1) {
         for (size_t i = 0; i < sizeof DECK / sizeof *DECK; i++)
             if (!strcasecmp(DECK[i].key, name + PREFIX_LEN)) return DECK[i].value;
+    } else if (p == 2) {
+        for (size_t i = 0; i < sizeof PS5 / sizeof *PS5; i++)
+            if (!strcasecmp(PS5[i].key, name + PREFIX_LEN)) return PS5[i].value;
     } else if (cfg_steam_console()) {
         for (size_t i = 0; i < sizeof CONSOLE / sizeof *CONSOLE; i++)
             if (!strcasecmp(CONSOLE[i].key, name + PREFIX_LEN)) return CONSOLE[i].value;
@@ -1106,7 +1128,10 @@ void cfg_init(void) {
             rt_log("cfg: game directory %s (settings %s)", game_dir, ini_path);
         }
     }
-    if (profile_of())
+    if (profile_of() == 1)
         rt_log("cfg: device profile Steam Deck: defaults for the keys mkw.ini does not set (MKW_DEVICE_PROFILE=desktop "
                "turns it off)");
+    if (profile_of() == 2)
+        rt_log("cfg: device profile PS5: defaults for the keys mkw.ini does not set (MKW_DEVICE_PROFILE=desktop turns it "
+               "off)");
 }
