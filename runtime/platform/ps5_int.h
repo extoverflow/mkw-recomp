@@ -5,9 +5,16 @@
 // spirv/, caches. A title's own folder (/app0) is read-only.
 #define PS5_DATA_DIR "/data/mkw-recomp"
 #include <stddef.h>
+#include <stdint.h>
 
 void alt_stack(void);   // ps5.c: a signal stack for the calling thread
 // ps5.c: the stacks' use (each one with each, then a summary line) into out; returns the length. Every stack is direct
 // memory sized from a measurement on Linux, so this is how the console shows that the sizes hold.
 int ps5_stack_report(char *out, size_t cap, int each);
 uint64_t ps5_mem_sibling_lifts(void);   // ps5_mem.c: accesses opened past a stricter 4 KiB sibling (diagnosis)
+
+// ps5_mem.c: a buffer the kernel is about to write (pread) made ready as a first write would make it (backed, marked
+// written where watched): the kernel's own writes do not fault into the handler.
+void ps5_mem_prepare_write(uint64_t a, uint64_t n);
+// Whether the guest may write all of [a, a + n); why (may be NULL): the first kernel page that refuses writes, if any.
+int ps5_mem_writable(uint64_t a, uint64_t n, char *why, size_t cap);
