@@ -54,7 +54,7 @@
 #include "platform/platform.h"
 #include "version.h"
 
-#define MAIN_BASE 0x7000000000ull
+#define MAIN_BASE (RT_KERNEL_BASE - 0x10000000ull)   // main's base (recomp/layout.py FIRST_BASE)
 #define MAIN_SPAN 0x10000000ull
 #define MAX_NODES 512
 #define HSIZE 2048   // power of two, > 2 * watched functions

@@ -1090,7 +1090,7 @@ static void host_ui_proj(Cpu *c) {
     if (seqwatch_probe())   // MKW_PROBE: every 2D projection setup in its window (the split HUD's digits, uw18-uw20)
         rt_log("patches: probe ui2d frame %llu di %#llx x %g -> %g lr main+%#llx full %d tx %g moved %d",
                (unsigned long long)frame_step_ticks(), (unsigned long long)c->x[0], s[0], m[0],
-               (unsigned long long)(c->x[30] - 0x7000000000ull), full, full == -1 ? 0 : tx, moved);
+               (unsigned long long)(c->x[30] - rt_game()->modules[0].base), full, full == -1 ? 0 : tx, moved);
 }
 
 // In place of ldp q2, q3, [x20, #0x10] at main+0x168a624: a pane drawn through a view-projection product made on the
