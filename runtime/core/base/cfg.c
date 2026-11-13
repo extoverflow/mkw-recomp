@@ -73,6 +73,9 @@ static const CfgRow rows[] = {
     S("HDR_SYSTEM", "display", "", NULL, LIVE),
     S("DEVICE_PROFILE", "display", "auto", "auto|desktop|deck", RESTART),
     S("RESOLUTION", "display", "original", "original|540|720|900|1080|1440|2160", RESTART),
+    // The 3D scene's lines apart from the screen's: "same" follows RESOLUTION, "original" keeps the game's (romfs_res.c);
+    // a temporal upscaler's quality takes precedence
+    S("RESOLUTION_3D", "display", "same", "same|original|540|720|900|1080|1440", RESTART),
     S("ASPECT", "display", "16:9", "16:9|window|21:9|32:9|48:9", RESTART),
     S("HUD_POSITION", "display", "16:9", "16:9|edges", RESTART),   // the race HUD in the middle 16:9 or at the screen edges
     // temporal upscaling in the place of the game's own (vk_temporal.c): the engine is live, the quality sets the
