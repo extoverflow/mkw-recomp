@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 
 #include "platform.h"
 #include "ps5_int.h"
@@ -52,6 +54,11 @@ int sceKernelDirectMemoryQuery(int64_t offset, int flags, DmemRegion *out, size_
 
 // All the pool's free memory and how many allocated regions there are: against the largest free block it tells holes
 // from exhaustion. -1 when the regions cannot be read.
+static double log_size(void) {   // the log's own writes (stdio and raw lines go to it, not through the file layer)
+    struct stat st;
+    return fstat(ps5_log_fd, &st) ? 0 : (double)st.st_size;
+}
+
 static int64_t dmem_free_total(unsigned *regions) {
     int64_t total = sceKernelGetDirectMemorySize(), taken = 0, offset = 0;
     unsigned n = 0;
@@ -71,14 +78,19 @@ static void memory_report(const char *when) {
     (void)sceKernelAvailableDirectMemorySize(0, sceKernelGetDirectMemorySize(), 0, &dphys, &dfree);
     unsigned regions = 0;
     int64_t ftotal = dmem_free_total(&regions);
+    // The title's writes to storage: a title writes at full speed for ~1.3 GiB, then ~2 MiB/s (ref/PS5_PayloadSDK
+    // platform/docs/PROBE.md:195-230), and every writer then waits (Step 5: hangs after 10-20 min).
+    struct rusage ru = {0};
+    (void)getrusage(RUSAGE_SELF, &ru);
     fprintf(stderr,
             "[host] ps5: memory %s: heap range %#llx+%#llx, mapped %.1f MiB (peak %.1f), in use %.1f MiB, %u segments, "
             "%u arenas, %llu libc fallbacks; flexible free %.1f MiB (%d); direct memory: largest free %.1f MiB at %.1f s, "
-            "free %.1f MiB in all, %u regions allocated; clock drift %lld us\n",
+            "free %.1f MiB in all, %u regions allocated; clock drift %lld us; storage blocks written %ld, read %ld; file layer wrote %.1f MiB, log %.1f MiB\n",
             when, (unsigned long long)h.range_base, (unsigned long long)h.range_bytes, h.mapped_bytes / 1048576.0,
             h.peak_bytes / 1048576.0, h.in_use_bytes / 1048576.0, h.segments, h.arenas, h.libc_fallbacks,
             flex / 1048576.0, fr, dfree / 1048576.0, plat_process_uptime_ns() / 1e9, ftotal / 1048576.0, regions,
-            (long long)(ps5_clock_drift_ns() / 1000));
+            (long long)(ps5_clock_drift_ns() / 1000), ru.ru_oublock, ru.ru_inblock,
+            __atomic_load_n(&ps5_fs_bytes_written, __ATOMIC_RELAXED) / 1048576.0, log_size() / 1048576.0);
     char st[900];
     if (ps5_mem_stats(st, sizeof st) > 0) fprintf(stderr, "[host] ps5: memory %s: %s\n", when, st);
 }
