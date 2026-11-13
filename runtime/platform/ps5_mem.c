@@ -58,11 +58,15 @@ enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW };   // PS_NONE.. are commi
 #define WW_ALL ((1u << SUB) - 1)     // ww[]: bits 0-3, one per 4 KiB page written since its last reset
 #define WW_PEND_SHIFT SUB            // ww[]: bits 4-7, reported and to unmark once the page is closed (a reset)
 #define WW_ON (1u << (2 * SUB))      // ww[]: the 16 KiB page lies in a watched reservation
-// Hot pages (MKW_PS5_WW_HOT, default on): a page reported written by WW_HOT_AFTER resets in a row (the game rewrites
+// Hot pages (MKW_PS5_WW_HOT=1; off by default since two silent crashes, below): a page reported written by WW_HOT_AFTER resets in a row (the game rewrites
 // its per-frame buffers every frame) stays open and is reported written by every query instead of being closed and
 // faulting again: each such cycle cost a signal, the lock and two mprotects (race, run 42: 1.18 M write-watch faults,
 // 117 us each with the lock waits; mprotect 36 us). A report may hold more pages than were written, never fewer. Every
 // WW_HOT_AGE resets a hot page is closed again, so pages the game stopped writing go back to being watched.
+// Off by default: a report is a generation stamp ("the CPU wrote here"), and the shadows copy stamped pages into the
+// GPU's copy at each submit and write the GPU's results back; a hot page stamped at every query can let an older guest
+// copy overwrite fresh GPU output (runs 45 and 48 ended with the console's "Game or App Error" CE-108255-1 near a race
+// start, no FATAL; none in five race runs without hot pages). Needs pages the GPU writes kept out before it is on.
 #define WW_HOT (1u << (2 * SUB + 1))  // ww[]: bit 9, the page is hot (open, always reported written)
 #define WW_SC_SHIFT (2 * SUB + 2)     // ww[]: bits 10-15, resets in a row that found it written; when hot, its age
 #define WW_SC_MASK (63u << WW_SC_SHIFT)
@@ -131,7 +135,7 @@ static int ww_hot_wanted(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("MKW_PS5_WW_HOT");
-        on = !(e && !strcmp(e, "0"));
+        on = e && !strcmp(e, "1");
     }
     return on;
 }
