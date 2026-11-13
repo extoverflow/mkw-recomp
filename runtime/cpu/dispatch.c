@@ -56,7 +56,7 @@ void rt_fatal(const char *fmt, ...) {
            prv / 1048576.0, used, total);
     fflush(stdout);
     fflush(stderr);
-    _Exit(70);
+    plat_exit(70);   // fflush + _exit on Linux, ExitProcess on Windows; the PS5 title asks the shell to close it
 }
 
 static const RtModule *module_at(uint64_t pc) {
