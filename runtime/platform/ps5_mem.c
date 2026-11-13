@@ -58,6 +58,16 @@ enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW };   // PS_NONE.. are commi
 #define WW_ALL ((1u << SUB) - 1)     // ww[]: bits 0-3, one per 4 KiB page written since its last reset
 #define WW_PEND_SHIFT SUB            // ww[]: bits 4-7, reported and to unmark once the page is closed (a reset)
 #define WW_ON (1u << (2 * SUB))      // ww[]: the 16 KiB page lies in a watched reservation
+// Hot pages (MKW_PS5_WW_HOT, default on): a page reported written by WW_HOT_AFTER resets in a row (the game rewrites
+// its per-frame buffers every frame) stays open and is reported written by every query instead of being closed and
+// faulting again: each such cycle cost a signal, the lock and two mprotects (race, run 42: 1.18 M write-watch faults,
+// 117 us each with the lock waits; mprotect 36 us). A report may hold more pages than were written, never fewer. Every
+// WW_HOT_AGE resets a hot page is closed again, so pages the game stopped writing go back to being watched.
+#define WW_HOT (1u << (2 * SUB + 1))  // ww[]: bit 9, the page is hot (open, always reported written)
+#define WW_SC_SHIFT (2 * SUB + 2)     // ww[]: bits 10-15, resets in a row that found it written; when hot, its age
+#define WW_SC_MASK (63u << WW_SC_SHIFT)
+#define WW_HOT_AFTER 3
+#define WW_HOT_AGE 256
 
 typedef struct {
     uint8_t state[CHUNK / PG];       // per 4 KiB page
@@ -107,11 +117,25 @@ static uint16_t *ww_of(uint64_t k) {
     return c ? &c->ww[(k % CHUNK) / KP] : NULL;
 }
 
-// A watched 16 KiB page not wholly marked written stays closed to writes, so the next write is seen.
+// A watched 16 KiB page not wholly marked written stays closed to writes, so the next write is seen (a hot page stays
+// open).
 static int ww_closed(uint64_t k) {
     uint16_t *w = ww_of(k);
-    return w && (*w & WW_ON) && (*w & WW_ALL) != WW_ALL;
+    return w && (*w & WW_ON) && !(*w & WW_HOT) && (*w & WW_ALL) != WW_ALL;
 }
+static int ww_score(uint16_t w) { return (int)(w >> WW_SC_SHIFT & 63); }
+static uint16_t ww_with_score(uint16_t w, int sc) {
+    return (uint16_t)((w & ~WW_SC_MASK) | ((unsigned)(sc > 63 ? 63 : sc) << WW_SC_SHIFT));
+}
+static int ww_hot_wanted(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("MKW_PS5_WW_HOT");
+        on = !(e && !strcmp(e, "0"));
+    }
+    return on;
+}
+static uint64_t st_hot_made, st_hot_aged;   // pages made hot, hot pages closed again by age
 
 // The fault on a write to a watched page: all four marked written, the page may open (vm_lock held).
 static void ww_mark(uint64_t k) {
@@ -242,7 +266,7 @@ static void unback(uint64_t k) {
     }
     if (c->phys) c->phys[i] = 0;
     c->backed[i / 8] &= (uint8_t)~(1u << (i % 8));
-    c->ww[i] &= (uint16_t)~WW_ALL;   // its pages read zero again: nothing written (as Linux, unpopulated pages)
+    c->ww[i] &= (uint16_t)WW_ON;   // its pages read zero again: nothing written (as Linux, unpopulated pages), not hot
 }
 
 // Whether no 4 KiB page of [a, a + n) is ours: a GiB without a chunk is all free.
@@ -394,7 +418,7 @@ static void ww_close_run(uint64_t run, uint64_t run_end, int prot) {
     kprot((void *)(uintptr_t)run, run_end - run, prot);
     for (uint64_t k = run; k < run_end; k += KP) {
         uint16_t *w = ww_of(k);
-        if (w) *w = (uint16_t)(*w & (WW_ON | WW_ALL) & ~(*w >> WW_PEND_SHIFT & WW_ALL));
+        if (w) *w = (uint16_t)(*w & ~(WW_ALL << WW_PEND_SHIFT) & ~(*w >> WW_PEND_SHIFT & WW_ALL));   // hot/score kept
     }
 }
 
@@ -412,9 +436,37 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
         if (!w || !(*w & WW_ON)) return UINT64_MAX;
     }
     plat_mutex_lock(&vm_lock);
+    int hot_on = ww_hot_wanted();
     for (uint64_t k = addr & ~(KP - 1); k < end && got < max; k += KP) {
         uint16_t *w = ww_of(k);
-        if (!(*w & WW_ALL)) continue;
+        if (*w & WW_HOT) {   // open: every committed 4 KiB page of it counts as written
+            for (uint64_t i = 0; i < SUB && got < max; i++) {
+                uint64_t p = k + i * PG;
+                if (p >= addr && p < end && st_get(p) >= PS_NONE) pages[got++] = p;
+            }
+            if (!reset) continue;
+            int age = ww_score(*w) + 1;
+            if (age < WW_HOT_AGE) {
+                *w = ww_with_score(*w, age);
+                continue;
+            }
+            // closed again to see whether the game still writes it (a write since faults and marks it as usual)
+            *w = (uint16_t)(*w & WW_ON);
+            st_add(&st_hot_aged, 1);
+            if (is_backed(k)) {
+                int prot = kpage_prot(k);
+                if (run_end != k || run_prot != prot) {
+                    ww_close_run(run, run_end, run_prot);
+                    run = k, run_prot = prot;
+                }
+                run_end = k + KP;
+            }
+            continue;
+        }
+        if (!(*w & WW_ALL)) {
+            if (reset && ww_score(*w)) *w = ww_with_score(*w, 0);   // a reset that found it unwritten: not hot
+            continue;
+        }
         uint8_t cleared = 0;
         for (uint64_t i = 0; i < SUB && got < max; i++) {
             uint64_t p = k + i * PG;
@@ -423,6 +475,13 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
             cleared |= (uint8_t)(1u << i);
         }
         if (!reset || !cleared) continue;
+        int sc = ww_score(*w) + 1;
+        if (hot_on && sc >= WW_HOT_AFTER && (*w & WW_ALL) == WW_ALL && is_backed(k) && (kpage_prot(k) & PROT_WRITE)) {
+            *w = (uint16_t)((*w & ~WW_SC_MASK) | WW_HOT);   // open already (wholly marked): stays so, age 0
+            st_add(&st_hot_made, 1);
+            continue;
+        }
+        *w = ww_with_score(*w, sc);
         // Closed first, unmarked after: a write that lands before the close was reported now; one after it faults
         // and waits for vm_lock in ps5_fault, then marks the page again. Open pages are closed in runs of the same
         // protection (an mprotect costs about 36 us per call on the console, mem_test 13/11/2026), so the marks of a
@@ -725,7 +784,7 @@ int ps5_mem_stats(char *out, size_t cap) {
                     "faults %llu (first touch %llu, write watch %llu, other %llu) %.2f s in all; backing %llu calls %.1f MiB "
                     "%.2f s (2 MiB blocks failed %llu, pages failed %llu; last %#llx states %#llx allocate %#x map %#x; hook "
                     "retried unbacked %llu; unback %llu, re-reserve failed %llu (%#x), release failed %llu (%#x)); mprotect %llu %.2f s; fault lock waits %.2f s; write-watch queries %llu, "
-                    "%.1f GiB, %.2f s",
+                    "%.1f GiB, %.2f s; hot pages made %llu, closed again %llu",
                     (unsigned long long)fn, (unsigned long long)st_fault_touch, (unsigned long long)st_fault_ww,
                     (unsigned long long)st_fault_other, st_fault_ns / 1e9, (unsigned long long)bn,
                     st_back_bytes / 1048576.0, st_back_ns / 1e9, (unsigned long long)st_block_fail,
@@ -734,5 +793,5 @@ int ps5_mem_stats(char *out, size_t cap) {
                     (unsigned long long)st_unback_n, (unsigned long long)st_unback_fail, (unsigned)st_unback_r,
                     (unsigned long long)st_release_fail, (unsigned)st_release_r, (unsigned long long)kn,
                     st_kprot_ns / 1e9, st_lockwait_ns / 1e9, (unsigned long long)st_ww_n, st_ww_bytes / 1073741824.0,
-                    st_ww_ns / 1e9);
+                    st_ww_ns / 1e9, (unsigned long long)st_hot_made, (unsigned long long)st_hot_aged);
 }
