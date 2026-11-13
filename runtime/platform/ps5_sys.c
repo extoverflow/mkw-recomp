@@ -43,7 +43,10 @@ size_t plat_getenv(const char *name, char *out, size_t cap) {
 }
 
 // /proc/self/exe on Linux; FreeBSD's sysctl kern.proc.pathname, which the PS5 does not answer (ENOENT, fs_diag
-// 12/11/2026), then a title's own executable, /app0/eboot.bin. A payload has neither: 0.
+// 12/11/2026). In a title (its executable is /app0/eboot.bin) the path names a program in PS5_DATA_DIR instead: every
+// caller uses the folder only, as the program's own (mkw.ini, exefs/, romfs/, profile/, spirv/, pipeline-cache.bin,
+// texpre/, lang/, shared-fonts/: cfg.c, main.c portable_paths, gfx_shader.c, vk_pipeline.c, ...), and /app0 is
+// read-only. A payload has neither: 0.
 #define PS5_TITLE_EXE "/app0/eboot.bin"
 
 int plat_exe_path(char *out, size_t cap) {
@@ -54,7 +57,7 @@ int plat_exe_path(char *out, size_t cap) {
         return 1;
     }
     struct stat st;
-    return !stat(PS5_TITLE_EXE, &st) && snprintf(out, cap, "%s", PS5_TITLE_EXE) < (int)cap;
+    return !stat(PS5_TITLE_EXE, &st) && snprintf(out, cap, "%s/mkw", PS5_DATA_DIR) < (int)cap;
 }
 
 // Cached per thread, as on Linux (every recursive mutex asks at each lock).
@@ -289,3 +292,26 @@ unsigned long long ZSTD_trace_decompress_begin(const void *dctx) {
     return 0;
 }
 void ZSTD_trace_decompress_end(unsigned long long ctx, const void *trace) { (void)ctx, (void)trace; }
+
+// strdup and strndup inside the console's libc allocate from libc's own small private heap, which the title's link
+// does not redirect (PS5_Vulkan tools/radv-link.sh wraps malloc and its family into the platform heap in direct
+// memory, not the libc functions that allocate). The RomFS index's 206,202 names ran it out ("RomFS: loose index
+// memory", 13/11/2026, with the platform heap at 64 MiB and no fallbacks): defined here, they take malloc's heap, for
+// the runtime and for the linked-in RADV alike; free takes them back the same way. Named ps5_* and bound to the libc
+// names at the title's link (the port's link script: --defsym and a local version script), as the link recipe
+// binds the platform layer's (PS5_Vulkan tools/radv-link.sh:96-116): a definition under libc's name would be exported,
+// and the title converter publishes no exports.
+char *ps5_strdup(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *d = malloc(n);
+    return d ? memcpy(d, s, n) : NULL;
+}
+
+char *ps5_strndup(const char *s, size_t max) {
+    size_t n = strnlen(s, max);
+    char *d = malloc(n + 1);
+    if (!d) return NULL;
+    memcpy(d, s, n);
+    d[n] = 0;
+    return d;
+}

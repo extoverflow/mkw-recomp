@@ -1,5 +1,9 @@
 // What the parts of the PS5 platform layer share (ps5.c, ps5_sync.c, ps5_fs.c, ps5_sys.c).
 #pragma once
+
+// The title's data folder: the log, args.txt, mkw.ini, the game's files, profile/,
+// spirv/, caches. A title's own folder (/app0) is read-only.
+#define PS5_DATA_DIR "/data/mkw-recomp"
 #include <stddef.h>
 
 void alt_stack(void);   // ps5.c: a signal stack for the calling thread
