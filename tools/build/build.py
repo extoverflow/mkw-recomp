@@ -54,7 +54,9 @@ GEN_ARCH_FLAGS = {"x86_64": [], "aarch64": ["-ffixed-x18"]}
 HOST_ARCH = {"amd64": "x86_64", "x64": "x86_64", "arm64": "aarch64"}.get(platform.machine().lower(),
                                                                           platform.machine().lower())  # fmt: skip
 ARCH = HOST_ARCH if HOST_ARCH in ARCH_FLAGS else "x86_64"
-GEN_FLAGS = ["-O1", "-fno-strict-aliasing", "-Wno-return-type", "-Wno-unused-label", "-fvisibility=hidden",
+# MKW_GEN_OPT (default -O1): the generated game code's optimisation level, to measure another (the PS5 runs the game's
+# frame on three cores at 3.5 GHz: its CPU time is the frame's critical path there).
+GEN_FLAGS = [os.environ.get("MKW_GEN_OPT", "-O1"), "-fno-strict-aliasing", "-Wno-return-type", "-Wno-unused-label", "-fvisibility=hidden",
              *ARCH_FLAGS[ARCH], *GEN_ARCH_FLAGS[ARCH]]  # fmt: skip
 RT_FLAGS = ["-O2", "-g", "-Wall", "-fno-strict-aliasing", *ARCH_FLAGS[ARCH]]
 sys.path.insert(0, str(ROOT / "recomp"))
