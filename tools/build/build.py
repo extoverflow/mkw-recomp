@@ -157,9 +157,10 @@ PS5 = Target(
     ROOT / "scratchpad/vma",
 )  # fmt: skip
 # The SDL3 front end's window, keyboard, start screen and menu events: not on the PS5 (platform/ps5_window.c is its
-# window; input.c and audio_mixer.c build against platform/ps5_sdl's SDL3 subset).
+# window; input.c and audio_mixer.c build against platform/ps5_sdl's SDL3 subset). switch2.c's Switch 2 controllers
+# come over Bluetooth LE through a transport the console does not have (linux_switch2.c, switch2_win.c).
 PS5_WITHOUT = {"gfx/nvn/host/gfx_window_sdl.c",
-               "input/input_sdl.c", "third_party/imgui/backends/imgui_impl_sdl3.cpp",
+               "input/input_sdl.c", "input/switch2.c", "third_party/imgui/backends/imgui_impl_sdl3.cpp",
                "third_party/imgui/backends/imgui_impl_sdlrenderer3.cpp", "ui/launcher/launcher.cpp",
                "ui/launcher/launcher_backdrop.cpp", "ui/launcher/launcher_setup.cpp", "ui/launcher/launcher_update.cpp",
                "ui/menu/menu_sdl.cpp"}  # fmt: skip

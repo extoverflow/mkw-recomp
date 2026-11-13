@@ -9,7 +9,8 @@
 //   src/Ryujinx.HLE/HOS/Services/Sockets/Bsd/Types: BsdSocketOption.cs, BsdSocketFlags.cs, BsdSocketCreationFlags.cs,
 //   EventFdFlags.cs, BsdSockAddr.cs, PollEventTypeMask.cs.
 // - errno is Linux's: the game compares GetLastErrno with 11 for EAGAIN (main+0x14c562c) and Ryujinx answers with its
-//   LinuxError; on Linux the host's errno goes through as is, on Windows WSA errors are mapped to it.
+//   LinuxError; on Linux the host's errno goes through as is, on Windows WSA errors are mapped to it, on the PS5
+//   FreeBSD's errno (EAGAIN is 35 there) by name.
 // - poll events are the same bits on both (POLLIN 1, POLLOUT 4, POLLERR 8, POLLHUP 0x10, POLLNVAL 0x20).
 //
 // Guest descriptors are indexes into a table of host sockets: Windows' SOCKET does not fit an int, and the game gets the
@@ -26,7 +27,7 @@
 // MKW_LAN off (the default) keeps main's stub, a console whose network is down: every socket call -1, errno ENETDOWN,
 // IsInitialized 1, no WSAStartup, so the online menu takes its no-connection path as before (issue #63).
 //
-// eventfd exists only on Linux; Windows answers ENOSYS. In main only gRPC's wakeup_fd_eventfd.cc (main+0x10208c0, the
+// eventfd exists only on Linux; Windows and the PS5 (FreeBSD) answer ENOSYS. In main only gRPC's wakeup_fd_eventfd.cc (main+0x10208c0, the
 // online services) calls EventFd*, after its availability check (main+0x1020a30); Pia never does.
 #include <stdint.h>
 #include <stdio.h>
@@ -54,7 +55,9 @@ typedef SOCKET HostSock;
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#ifdef __linux__
 #include <sys/eventfd.h>
+#endif
 #include <sys/socket.h>
 #include <unistd.h>
 typedef int HostSock;
@@ -150,8 +153,33 @@ static int host_errno(void) {
     default: return G_EIO;
     }
 }
-#else
+#elif defined(__linux__)
 static int host_errno(void) { return errno; }
+#else
+// FreeBSD's numbers (the PS5) differ from Linux's past the first few: mapped by name, as Windows' WSA errors are.
+static int host_errno(void) {
+    switch (errno) {
+    case EAGAIN: return G_EAGAIN;
+    case EINTR: return G_EINTR;
+    case EBADF: return G_EBADF;
+    case ENOTSOCK: return G_ENOTSOCK;
+    case EACCES: return G_EACCES;
+    case EINVAL: return G_EINVAL;
+    case EMFILE: return G_EMFILE;
+    case EMSGSIZE: return G_EMSGSIZE;
+    case ENOPROTOOPT: return G_ENOPROTOOPT;
+    case EAFNOSUPPORT: return G_EAFNOSUPPORT;
+    case EADDRINUSE: return G_EADDRINUSE;
+    case EADDRNOTAVAIL: return G_EADDRNOTAVAIL;
+    case ENETUNREACH: return G_ENETUNREACH;
+    case ECONNRESET: return G_ECONNRESET;
+    case ENOBUFS: return G_ENOBUFS;
+    case ETIMEDOUT: return G_ETIMEDOUT;
+    case EHOSTUNREACH: return G_EHOSTUNREACH;
+    case ENOSYS: return G_ENOSYS;
+    default: return G_EIO;
+    }
+}
 #endif
 
 // A copy of slot fd into *out; 0, or -1 with EBADF when fd is not open
@@ -586,8 +614,8 @@ static void ov_poll(Cpu *c) {
 // int EventFd(uint64_t initval, EventFdFlags flags)
 static void ov_eventfd(Cpu *c) {
     LAN_OR_DOWN(c);
-#ifdef _WIN32
-    // ponytail: no eventfd on Windows; only gRPC (online) calls it, see the top. A loopback socket pair if Pia ever does
+#if defined(_WIN32) || !defined(__linux__)
+    // ponytail: no eventfd on Windows or the PS5; only gRPC (online) calls it, see the top. A loopback socket pair if Pia ever does
     fail(G_ENOSYS);
     ret_x(c, (uint64_t)-1);
 #else
