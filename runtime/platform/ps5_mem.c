@@ -442,6 +442,15 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
     plat_mutex_lock(&vm_lock);
     int hot_on = ww_hot_wanted();
     for (uint64_t k = addr & ~(KP - 1); k < end && got < max; k += KP) {
+        // The lock is let go at each 2 MiB boundary of a long range (its run closed first): a page's state is handled
+        // whole under the lock, and the query need not hold it across the range, while faulting threads wait for it
+        // (race, run 42: 89 s of fault-lock waits; a frame's ~500 queries hold it 2.4-5.7 ms).
+        if (k != (addr & ~(KP - 1)) && !(k & (BLOCK - 1))) {
+            ww_close_run(run, run_end, run_prot);
+            run = run_end = 0;
+            plat_mutex_unlock(&vm_lock);
+            plat_mutex_lock(&vm_lock);
+        }
         uint16_t *w = ww_of(k);
         if (*w & WW_HOT) {   // open: every committed 4 KiB page of it counts as written
             for (uint64_t i = 0; i < SUB && got < max; i++) {
