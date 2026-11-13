@@ -124,7 +124,9 @@ PS5 = Target(
     ROOT / "build/mkw.elf",
     # -msha: clang's intrinsic headers hide SHA on the PS5 target unless the whole file has it (core/base/sha256.c)
     # -isystem: searched after the runtime's -I list, so PS5_LIBS's own imgui.h does not shadow runtime/third_party's
-    ["-msha", f"-include{RUNTIME / 'platform/ps5_compat.h'}", f"-isystem{PS5_LIBS / 'include'}",
+    # IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS: ImGui's link opener forks, and a title has no fork
+    ["-msha", "-DIMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS", f"-include{RUNTIME / 'platform/ps5_compat.h'}",
+     f"-isystem{PS5_LIBS / 'include'}",
      f"-isystem{ROOT / 'build/ps5-deps/include'}"],
     [], [],
     ROOT / "scratchpad/vma",
