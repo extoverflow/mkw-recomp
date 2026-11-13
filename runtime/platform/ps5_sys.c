@@ -270,7 +270,8 @@ int64_t plat_threads_cpu_ns_named(const char *name) {
 }
 
 // No FIFOs for a title (and no mkfifo in the modules it loads): core/base/ctl.c's MKW_CTL then logs that it is off.
-int mkfifo(const char *path, mode_t mode) {
+// Weak: a payload's libc.a has the system call, which wins.
+__attribute__((weak)) int mkfifo(const char *path, mode_t mode) {
     (void)path, (void)mode;
     errno = ENOTSUP;
     return -1;

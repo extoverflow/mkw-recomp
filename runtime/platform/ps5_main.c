@@ -2,7 +2,7 @@
 // from ARGS (one per line or space-separated, as on a command line; NAME=value sets an environment variable; none: run
 // the game), and standard output and standard error go to LOG (a file the web file manager reads). The shell's splash
 // is dismissed, and the title ends by asking the shell to close it: exit() or returning from _start makes the console report a crash
-// (PS5_VulkanTemplate ps5/src/platform.c:47-88, MIT, Copyright (C) 2026 Mihawk: the same calls). The runtime's own
+// (PS5_VulkanTemplate ps5/src/platform.c:48-56 and 82-89, MIT, Copyright (C) 2026 Mihawk: the same calls). The runtime's own
 // main() is mkw_main (ps5_compat.h renames it).
 #undef main
 #include <fcntl.h>
