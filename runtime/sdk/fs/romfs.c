@@ -430,9 +430,10 @@ static void loose_add(const char *rel, uint64_t size) {
     loose_n++;
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__PROSPERO__)
 // mingw-w64's nftw stats every file (19-41 s for the 205 780 files); a directory listing already holds each size
-// (plat_fs_list: FindFirstFileExW with large fetches). Links are not entered, as with FTW_PHYS.
+// (plat_fs_list: FindFirstFileExW with large fetches). Links are not entered, as with FTW_PHYS. The PS5's C library
+// has no nftw for a title: the same walk.
 typedef struct { char path[4096]; size_t len, rel; } LooseWalk;   // rel: where the RomFS path starts in path
 
 static int loose_entry(const char *name, int kind, uint64_t size, void *ctx) {
