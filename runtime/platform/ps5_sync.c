@@ -15,11 +15,39 @@
 
 // ---- time
 
-uint64_t plat_now_ns(void) {
+// From the TSC, not clock_gettime: on the console clock_gettime is a system call (~800 ns; PlayTendoh
+// docs/DRIVER-PERFORMANCE.md @ 6204180), and the runtime reads the clock on every fault, lock report and write-watch
+// query (run 37: 14 % of the replay thread's samples in clock_gettime). The TSC is invariant and shared by the cores;
+// sceKernelGetTscFrequency gives its rate. Anchored to CLOCK_MONOTONIC at the first read, so values keep that clock's
+// epoch (timed waits take absolute CLOCK_MONOTONIC deadlines); ps5_clock_drift_ns tells how far they drift.
+uint64_t sceKernelGetTscFrequency(void);
+static uint64_t tsc0, ns0, mul;   // ns = ns0 + ((tsc - tsc0) * mul >> 32)
+static uint64_t kernel_now_ns(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
 }
+static void tsc_init(void) {
+    uint64_t hz = sceKernelGetTscFrequency();
+    uint64_t t = __builtin_ia32_rdtsc(), n = kernel_now_ns();
+    uint64_t m = hz ? (uint64_t)(((unsigned __int128)1000000000u << 32) / hz) : 0;
+    __atomic_store_n(&tsc0, t, __ATOMIC_RELAXED);
+    __atomic_store_n(&ns0, n, __ATOMIC_RELAXED);
+    __atomic_store_n(&mul, m, __ATOMIC_RELEASE);
+}
+uint64_t plat_now_ns(void) {
+    uint64_t m = __atomic_load_n(&mul, __ATOMIC_ACQUIRE);
+    if (!m) {
+        static int once;
+        if (!__atomic_exchange_n(&once, 1, __ATOMIC_ACQ_REL)) tsc_init();
+        m = __atomic_load_n(&mul, __ATOMIC_ACQUIRE);
+        if (!m) return kernel_now_ns();   // another thread is setting it up, or no TSC rate
+    }
+    uint64_t d = __builtin_ia32_rdtsc() - tsc0;
+    return ns0 + (uint64_t)(((unsigned __int128)d * m) >> 32);
+}
+// The TSC clock less the kernel's, now (positive: ahead); for the memory line.
+int64_t ps5_clock_drift_ns(void) { return (int64_t)(plat_now_ns() - kernel_now_ns()); }
 
 uint64_t plat_counter(void) { return plat_now_ns(); }
 uint64_t plat_counter_hz(void) { return 1000000000u; }
