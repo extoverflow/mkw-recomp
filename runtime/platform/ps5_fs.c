@@ -49,12 +49,16 @@ void plat_file_mkdir_p(const char *path) {
     mkdir(tmp, 0755);
 }
 
+// Bytes the runtime's file layer wrote (the title's storage write budget: ps5_main.c memory_report).
+uint64_t ps5_fs_bytes_written;
+
 static int write_all(int fd, const void *data, size_t n) {
     const uint8_t *p = data;
     while (n) {
         ssize_t k = write(fd, p, n);
         if (k < 0 && errno == EINTR) continue;
         if (k <= 0) return 0;
+        __atomic_add_fetch(&ps5_fs_bytes_written, (uint64_t)k, __ATOMIC_RELAXED);
         p += k, n -= (size_t)k;
     }
     return 1;
@@ -105,6 +109,7 @@ int plat_append_write(PlatAppend *f, const void *data, size_t n) {
     ssize_t k;
     do k = write(fd, data, n);
     while (k < 0 && errno == EINTR);
+    if (k > 0) __atomic_add_fetch(&ps5_fs_bytes_written, (uint64_t)k, __ATOMIC_RELAXED);
     return k == (ssize_t)n;
 }
 
@@ -381,6 +386,7 @@ int64_t plat_file_pwrite(PlatFile *f, const void *buf, uint32_t n, uint64_t off)
     ssize_t k;
     do k = pwrite(fd_of(f), buf, n, (off_t)off);
     while (k < 0 && errno == EINTR);
+    if (k > 0) __atomic_add_fetch(&ps5_fs_bytes_written, (uint64_t)k, __ATOMIC_RELAXED);
     return k;
 }
 
