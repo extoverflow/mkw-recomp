@@ -6,6 +6,7 @@
 // 84 KiB deep, runtime threads 212 KiB), below each an unmapped guard. Code map and divergences:
 // kept outside this repo.
 #include <errno.h>
+#include <stdarg.h>
 #include <pthread.h>
 #include <pthread_np.h>
 #include <sched.h>
@@ -197,11 +198,153 @@ void alt_stack(void) {
     sigaltstack(&ss, NULL);
 }
 
+// ---- thread dump (PS5 only, for a hang: Linux has tools/run/stacks.py over ptrace, a title has no debugger). The
+// runtime's threads register themselves; ps5_dump_threads stops each with SIGUSR2 and logs its instruction pointer and
+// the stack words that point into the executable's code (return addresses, mostly), as offsets from its start, for
+// llvm-symbolizer on the linked ELF. A scan, not an unwind: the code has no frame pointers.
+#define DUMP_MAX 512
+#define DUMP_WORDS 24
+#define DUMP_SIG SIGUSR2
+typedef struct {
+    pthread_t t;
+    uint64_t lo, hi;   // the thread's stack
+    char name[32];
+    int live;
+} DumpThread;
+static DumpThread dump_threads[DUMP_MAX];
+static PlatMutex dump_lock = PLAT_MUTEX_INIT;
+static struct {
+    volatile int done;
+    uint64_t lo, hi, rip, rsp, n, w[DUMP_WORDS];
+} dump_res;
+extern const char __ehdr_start[];   // the executable's start: .text begins there (lld)
+// The code's end: the port's linker script defines it at the title's link. Weak: the payload tests have no such
+// symbol, and their dump then takes no stack words. (The ELF header is not mapped in a title: reading its program
+// headers at __ehdr_start faulted, 13/11/2026.)
+extern const char mkw_text_end[] __attribute__((weak));
+static uint64_t text_lo, text_hi;
+
+static void text_range(void) {
+    text_lo = (uint64_t)(uintptr_t)__ehdr_start;
+    text_hi = mkw_text_end ? (uint64_t)(uintptr_t)mkw_text_end : text_lo;
+}
+
+// Records where the thread is, from its context only: no memory is read here (a page the reported stack bounds include
+// can be reserved but unmapped, and a fault in this handler ends the title: the first two dumps, 13/11/2026).
+static void dump_handler(int sig, siginfo_t *si, void *uc) {
+    (void)sig, (void)si;
+    ucontext_t *u = uc;
+    dump_res.rip = (uint64_t)u->uc_mcontext.mc_rip, dump_res.rsp = (uint64_t)u->uc_mcontext.mc_rsp;
+    __atomic_store_n(&dump_res.done, 1, __ATOMIC_RELEASE);
+}
+
+// The code addresses among the words of [rsp, rsp + 64 KiB) inside the stack's bounds, read by the dumping thread
+// through a pipe: write(2) from an unreadable page fails with EFAULT instead of faulting.
+static void dump_scan(uint64_t rsp, uint64_t lo_stack, uint64_t hi_stack) {
+    static int pfd[2] = {-1, -1};
+    dump_res.n = 0;
+    if (rsp < lo_stack || rsp >= hi_stack || (pfd[0] < 0 && pipe(pfd))) return;
+    uint64_t end = hi_stack < rsp + (64u << 10) ? hi_stack : rsp + (64u << 10);
+    static uint64_t buf[512];
+    for (uint64_t a = rsp & ~7ull; a < end && dump_res.n < DUMP_WORDS;) {
+        uint64_t chunk = ((a | 0xfff) + 1) - a;   // to the next 4 KiB boundary
+        if (chunk > end - a) chunk = end - a;
+        ssize_t w = write(pfd[1], (const void *)(uintptr_t)a, (size_t)chunk);
+        if (w <= 0) break;
+        ssize_t r = read(pfd[0], buf, (size_t)w);
+        for (ssize_t i = 0; i + 8 <= r && dump_res.n < DUMP_WORDS; i += 8) {
+            uint64_t v = buf[i / 8];
+            if (v >= text_lo && v < text_hi) dump_res.w[dump_res.n++] = v;
+        }
+        a += (uint64_t)w;
+    }
+}
+
+void ps5_dump_register(const char *name) {
+    pthread_attr_t a;
+    void *addr = NULL;
+    size_t size = 0;
+    pthread_attr_init(&a);
+    if (!pthread_attr_get_np(pthread_self(), &a)) pthread_attr_getstack(&a, &addr, &size);
+    pthread_attr_destroy(&a);
+    plat_mutex_lock(&dump_lock);
+    for (int i = 0; i < DUMP_MAX; i++)
+        if (!dump_threads[i].live) {
+            dump_threads[i] = (DumpThread){pthread_self(), (uint64_t)(uintptr_t)addr, (uint64_t)(uintptr_t)addr + size,
+                                           "", 1};
+            snprintf(dump_threads[i].name, sizeof dump_threads[i].name, "%s", name ? name : "?");
+            break;
+        }
+    plat_mutex_unlock(&dump_lock);
+}
+
+static void dump_unregister(void) {
+    plat_mutex_lock(&dump_lock);
+    for (int i = 0; i < DUMP_MAX; i++)
+        if (dump_threads[i].live && pthread_equal(dump_threads[i].t, pthread_self())) dump_threads[i].live = 0;
+    plat_mutex_unlock(&dump_lock);
+}
+
+// Written with write(2) to fd, not stdio: a stuck thread may hold the log stream's lock (13/11/2026: the first dump
+// through fprintf blocked, and with it every log line).
+static void dump_line(int fd, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void dump_line(int fd, const char *fmt, ...) {
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (n > 0) (void)!write(fd, line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
+}
+
+void ps5_dump_threads(int fd) {
+    static int installed;
+    if (!installed) {
+        struct sigaction sa = {.sa_sigaction = dump_handler, .sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK};
+        sigemptyset(&sa.sa_mask);
+        int r = sigaction(DUMP_SIG, &sa, NULL);
+        text_range();
+        dump_line(fd, "dump: handler %d, code %#llx-%#llx\n", r, (unsigned long long)text_lo, (unsigned long long)text_hi);
+        installed = 1;
+    }
+    uint64_t base = (uint64_t)(uintptr_t)__ehdr_start;
+    plat_mutex_lock(&dump_lock);
+    int shown = 0;
+    for (int i = 0; i < DUMP_MAX; i++) {
+        DumpThread *d = &dump_threads[i];
+        if (!d->live || pthread_equal(d->t, pthread_self())) continue;
+        dump_res.done = 0, dump_res.lo = d->lo, dump_res.hi = d->hi;
+        dump_line(fd, "thread %d '%s': signalling (stack %#llx-%#llx)\n", i, d->name, (unsigned long long)d->lo,
+                  (unsigned long long)d->hi);
+        if (pthread_kill(d->t, DUMP_SIG)) continue;
+        uint64_t t0 = plat_now_ns();
+        while (!__atomic_load_n(&dump_res.done, __ATOMIC_ACQUIRE) && plat_now_ns() - t0 < 300000000ull) plat_sleep_ms(1);
+        if (!dump_res.done) {
+            dump_line(fd, "thread %d '%s': no answer in 300 ms\n", i, d->name);
+            continue;
+        }
+        dump_line(fd, "thread %d: answered, rip %#llx rsp %#llx; scanning\n", i,
+                  (unsigned long long)(dump_res.rip - base), (unsigned long long)dump_res.rsp);
+        dump_scan(dump_res.rsp, d->lo, d->hi);
+        char words[DUMP_WORDS * 20] = "";
+        int k = 0;
+        for (uint64_t w = 0; w < dump_res.n && k < (int)sizeof words; w++)
+            k += snprintf(words + k, sizeof words - (size_t)k, " %#llx", (unsigned long long)(dump_res.w[w] - base));
+        dump_line(fd, "thread %d '%s' rip %#llx rsp %#llx; stack:%s\n", i, d->name,
+                  (unsigned long long)(dump_res.rip - base), (unsigned long long)dump_res.rsp, words);
+        shown++;
+    }
+    plat_mutex_unlock(&dump_lock);
+    dump_line(fd, "dump: %d threads (offsets from the executable's start, %#llx)\n", shown, (unsigned long long)base);
+}
+
 static void *thread_main(void *p) {
     PlatThread *t = p;
     alt_stack();
     if (t->name[0]) pthread_set_name_np(pthread_self(), t->name);
+    ps5_dump_register(t->name[0] ? t->name : "thread");
     t->fn(t->arg);
+    dump_unregister();
     // Detached: nobody joins, so the thread hands its stack back itself; stack_get reuses it only once this thread is
     // gone (pthread_kill reports ESRCH) and STACK_REUSE_NS has passed.
     if (__atomic_load_n(&t->detached, __ATOMIC_ACQUIRE)) stack_put(t->stack, pthread_self());

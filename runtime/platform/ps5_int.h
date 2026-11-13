@@ -18,3 +18,9 @@ uint64_t ps5_mem_sibling_lifts(void);   // ps5_mem.c: accesses opened past a str
 void ps5_mem_prepare_write(uint64_t a, uint64_t n);
 // Whether the guest may write all of [a, a + n); why (may be NULL): the first kernel page that refuses writes, if any.
 int ps5_mem_writable(uint64_t a, uint64_t n, char *why, size_t cap);
+
+// ps5.c: the thread dump for a hang (PS5 only). Threads made by plat_thread_new register themselves; another (the
+// title's main thread) calls ps5_dump_register. ps5_dump_threads writes every other registered thread's instruction
+// pointer and the code addresses on its stack to fd (write(2), no stdio).
+void ps5_dump_register(const char *name);
+void ps5_dump_threads(int fd);

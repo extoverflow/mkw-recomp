@@ -42,18 +42,22 @@ struct ps5_heap_stats {
 };
 void ps5_heap_stats(struct ps5_heap_stats *stats);
 int sceKernelAvailableFlexibleMemorySize(size_t *size);
+int sceKernelAvailableDirectMemorySize(int64_t start, int64_t end, size_t align, int64_t *phys, size_t *size);
+int64_t sceKernelGetDirectMemorySize(void);
 
 static void memory_report(const char *when) {
     struct ps5_heap_stats h = {0};
     ps5_heap_stats(&h);
-    size_t flex = 0;
+    size_t flex = 0, dfree = 0;
+    int64_t dphys = 0;
     int fr = sceKernelAvailableFlexibleMemorySize(&flex);
+    (void)sceKernelAvailableDirectMemorySize(0, sceKernelGetDirectMemorySize(), 0, &dphys, &dfree);
     fprintf(stderr,
             "[host] ps5: memory %s: heap range %#llx+%#llx, mapped %.1f MiB (peak %.1f), in use %.1f MiB, %u segments, "
-            "%u arenas, %llu libc fallbacks; flexible free %.1f MiB (%d)\n",
+            "%u arenas, %llu libc fallbacks; flexible free %.1f MiB (%d); direct memory: largest free %.1f MiB at %.1f s\n",
             when, (unsigned long long)h.range_base, (unsigned long long)h.range_bytes, h.mapped_bytes / 1048576.0,
             h.peak_bytes / 1048576.0, h.in_use_bytes / 1048576.0, h.segments, h.arenas, h.libc_fallbacks,
-            flex / 1048576.0, fr);
+            flex / 1048576.0, fr, dfree / 1048576.0, plat_process_uptime_ns() / 1e9);
 }
 
 // Descriptors 1 and 2, and so the streams stdout and stderr, go to LOG. A title may not dup2 (the console refuses it
@@ -180,8 +184,63 @@ static int list_test(const char *dir) {
     return 0;
 }
 
+// A hang's thread dump on request: whenever DUMP_TRIGGER appears (tools/ps5-put.sh of any file there), every thread's
+// instruction pointer and stack code addresses are appended to DUMP_OUT (ps5.c ps5_dump_threads), and the trigger is
+// removed. Not through the log: a stuck thread may hold its stream's lock.
+#define DUMP_TRIGGER PS5_DIR "/dump-threads"
+#define DUMP_OUT PS5_DIR "/threads.txt"
+static void dump_watch(void *arg) {
+    (void)arg;
+    for (int n = 1, tick = 0;; ) {
+        plat_sleep_ms(2000);
+        if (++tick % 30 == 0) memory_report("every 60 s");   // the memory budget while the game runs (Step 4)
+        if (access(DUMP_TRIGGER, F_OK)) continue;
+        unlink(DUMP_TRIGGER);
+        int fd = open(DUMP_OUT, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd < 0) continue;
+        char head[96];
+        int k = snprintf(head, sizeof head, "== dump %d at %.3f s\n", n++, plat_process_uptime_ns() / 1e9);
+        (void)!write(fd, head, (size_t)k);
+        ps5_dump_threads(fd);
+        close(fd);
+    }
+}
+
+// --ps5-signal-test: which signals a title's threads get (sigaction's answer, then a pthread_kill to a sleeping thread),
+// one per run step, so a signal that kills the title shows as the last line.
+#include <signal.h>
+#include <pthread.h>
+static volatile int sig_seen;
+static void sig_test_handler(int sig) { sig_seen = sig; }
+static void sig_test_sleeper(void *arg) {
+    (void)arg;
+    for (;;) plat_sleep_ms(50);
+}
+static int signal_test(void) {
+    static const int sigs[] = {SIGUSR1, SIGINFO, SIGWINCH, SIGPROF, SIGXCPU, SIGVTALRM, SIGUSR2};
+    PlatThread *t = plat_thread_new(sig_test_sleeper, NULL, "sleeper");
+    pthread_t pt = *(pthread_t *)t;   // ps5.c's PlatThread starts with its pthread_t
+    plat_sleep_ms(100);
+    for (unsigned i = 0; i < sizeof sigs / sizeof *sigs; i++) {
+        struct sigaction sa = {.sa_handler = sig_test_handler}, old;
+        sigemptyset(&sa.sa_mask);
+        int r = sigaction(sigs[i], &sa, &old);
+        printf("ps5-signal-test: signal %d: sigaction %d (errno %d), sending...\n", sigs[i], r, r ? errno : 0);
+        sig_seen = 0;
+        int k = pthread_kill(pt, sigs[i]);
+        uint64_t t0 = plat_now_ns();
+        while (!sig_seen && plat_now_ns() - t0 < 500000000ull) plat_sleep_ms(1);
+        printf("ps5-signal-test: signal %d: pthread_kill %d, handler %s\n", sigs[i], k, sig_seen == sigs[i] ? "ran" : "did not run");
+        sigaction(sigs[i], &old, NULL);
+    }
+    printf("ps5-signal-test: done\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     (void)argc;
+    ps5_dump_register("main");
+    plat_thread_spawn(dump_watch, NULL, "dump watch", 0);
     // The SDK's stdio.h expands getc/putc/putchar/fileno/feof inline on FreeBSD's FILE layout unless __isthreaded is
     // set, and the system libc's FILE is not that layout (title run: putchar wrote through a bad pointer). The payload
     // SDK's start code sets it (ref/PS5_PayloadSDK/crt/crt.c:65-69); the title's (PS5_Vulkan tooling/native/app_crt.cpp)
@@ -222,6 +281,7 @@ int main(int argc, char **argv) {
     int status = n >= 2 && !strcmp(args[1], "--ps5-pad-test")    ? pad_test(n >= 3 ? atoi(args[2]) : 20)
                  : n >= 2 && !strcmp(args[1], "--ps5-tone-test") ? tone_test(n >= 3 ? atoi(args[2]) : 3)
                  : n >= 3 && !strcmp(args[1], "--ps5-list-test") ? list_test(args[2])
+                 : n >= 2 && !strcmp(args[1], "--ps5-signal-test") ? signal_test()
                                                                   : mkw_main(n, args);
     fprintf(stderr, "[host] ps5: mkw_main returned %d\n", status);
     return status;
