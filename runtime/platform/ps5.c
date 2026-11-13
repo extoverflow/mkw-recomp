@@ -215,7 +215,7 @@ static DumpThread dump_threads[DUMP_MAX];
 static PlatMutex dump_lock = PLAT_MUTEX_INIT;
 static struct {
     volatile int done;
-    uint64_t lo, hi, rip, rsp, n, w[DUMP_WORDS];
+    uint64_t lo, hi, rip, rsp, rdi, n, w[DUMP_WORDS];
 } dump_res;
 extern const char __ehdr_start[];   // the executable's start: .text begins there (lld)
 // The code's end: the port's linker script defines it at the title's link. Weak: the payload tests have no such
@@ -235,6 +235,7 @@ static void dump_handler(int sig, siginfo_t *si, void *uc) {
     (void)sig, (void)si;
     ucontext_t *u = uc;
     dump_res.rip = (uint64_t)u->uc_mcontext.mc_rip, dump_res.rsp = (uint64_t)u->uc_mcontext.mc_rsp;
+    dump_res.rdi = (uint64_t)u->uc_mcontext.mc_rdi;   // in a wait system call: the object waited on (_umtx_op's first)
     __atomic_store_n(&dump_res.done, 1, __ATOMIC_RELEASE);
 }
 
@@ -297,6 +298,43 @@ static void dump_line(int fd, const char *fmt, ...) {
     if (n > 0) (void)!write(fd, line, (size_t)n < sizeof line ? (size_t)n : sizeof line - 1);
 }
 
+// The threads named name, count times, every interval_ms: a profile of where that thread spends its time (each line
+// as ps5_dump_threads writes it). The registry is read under dump_lock each round, so threads may come and go.
+static int dump_one(int fd, DumpThread *d, int i, uint64_t base);
+
+void ps5_dump_sample(int fd, const char *name, int count, int interval_ms) {
+    ps5_dump_threads(-1);   // installs the handler and the code range without writing anything
+    uint64_t base = (uint64_t)(uintptr_t)__ehdr_start;
+    for (int k = 0; k < count; k++) {
+        plat_mutex_lock(&dump_lock);
+        for (int i = 0; i < DUMP_MAX; i++)
+            if (dump_threads[i].live && !strcmp(dump_threads[i].name, name)) dump_one(fd, &dump_threads[i], i, base);
+        plat_mutex_unlock(&dump_lock);
+        plat_sleep_ms((uint32_t)interval_ms);
+    }
+    dump_line(fd, "sample: %d rounds of '%s' every %d ms\n", count, name, interval_ms);
+}
+
+static int dump_one(int fd, DumpThread *d, int i, uint64_t base) {
+    dump_res.done = 0, dump_res.lo = d->lo, dump_res.hi = d->hi;
+    if (pthread_kill(d->t, DUMP_SIG)) return 0;
+    uint64_t t0 = plat_now_ns();
+    while (!__atomic_load_n(&dump_res.done, __ATOMIC_ACQUIRE) && plat_now_ns() - t0 < 300000000ull) sched_yield();
+    if (!dump_res.done) {
+        dump_line(fd, "thread %d '%s': no answer in 300 ms\n", i, d->name);
+        return 0;
+    }
+    dump_scan(dump_res.rsp, d->lo, d->hi);
+    char words[DUMP_WORDS * 20] = "";
+    int k = 0;
+    for (uint64_t w = 0; w < dump_res.n && k < (int)sizeof words; w++)
+        k += snprintf(words + k, sizeof words - (size_t)k, " %#llx", (unsigned long long)(dump_res.w[w] - base));
+    dump_line(fd, "thread %d '%s' rip %#llx rsp %#llx rdi %#llx; stack:%s\n", i, d->name,
+              (unsigned long long)(dump_res.rip - base), (unsigned long long)dump_res.rsp,
+              (unsigned long long)dump_res.rdi, words);
+    return 1;
+}
+
 void ps5_dump_threads(int fd) {
     static int installed;
     if (!installed) {
@@ -304,38 +342,22 @@ void ps5_dump_threads(int fd) {
         sigemptyset(&sa.sa_mask);
         int r = sigaction(DUMP_SIG, &sa, NULL);
         text_range();
-        dump_line(fd, "dump: handler %d, code %#llx-%#llx\n", r, (unsigned long long)text_lo, (unsigned long long)text_hi);
+        if (fd >= 0)
+            dump_line(fd, "dump: handler %d, code %#llx-%#llx\n", r, (unsigned long long)text_lo,
+                      (unsigned long long)text_hi);
         installed = 1;
     }
     uint64_t base = (uint64_t)(uintptr_t)__ehdr_start;
     plat_mutex_lock(&dump_lock);
     int shown = 0;
-    for (int i = 0; i < DUMP_MAX; i++) {
+    for (int i = 0; i < DUMP_MAX && fd >= 0; i++) {
         DumpThread *d = &dump_threads[i];
         if (!d->live || pthread_equal(d->t, pthread_self())) continue;
-        dump_res.done = 0, dump_res.lo = d->lo, dump_res.hi = d->hi;
-        dump_line(fd, "thread %d '%s': signalling (stack %#llx-%#llx)\n", i, d->name, (unsigned long long)d->lo,
-                  (unsigned long long)d->hi);
-        if (pthread_kill(d->t, DUMP_SIG)) continue;
-        uint64_t t0 = plat_now_ns();
-        while (!__atomic_load_n(&dump_res.done, __ATOMIC_ACQUIRE) && plat_now_ns() - t0 < 300000000ull) plat_sleep_ms(1);
-        if (!dump_res.done) {
-            dump_line(fd, "thread %d '%s': no answer in 300 ms\n", i, d->name);
-            continue;
-        }
-        dump_line(fd, "thread %d: answered, rip %#llx rsp %#llx; scanning\n", i,
-                  (unsigned long long)(dump_res.rip - base), (unsigned long long)dump_res.rsp);
-        dump_scan(dump_res.rsp, d->lo, d->hi);
-        char words[DUMP_WORDS * 20] = "";
-        int k = 0;
-        for (uint64_t w = 0; w < dump_res.n && k < (int)sizeof words; w++)
-            k += snprintf(words + k, sizeof words - (size_t)k, " %#llx", (unsigned long long)(dump_res.w[w] - base));
-        dump_line(fd, "thread %d '%s' rip %#llx rsp %#llx; stack:%s\n", i, d->name,
-                  (unsigned long long)(dump_res.rip - base), (unsigned long long)dump_res.rsp, words);
-        shown++;
+        shown += dump_one(fd, d, i, base);
     }
     plat_mutex_unlock(&dump_lock);
-    dump_line(fd, "dump: %d threads (offsets from the executable's start, %#llx)\n", shown, (unsigned long long)base);
+    if (fd >= 0)
+        dump_line(fd, "dump: %d threads (offsets from the executable's start, %#llx)\n", shown, (unsigned long long)base);
 }
 
 static void *thread_main(void *p) {
