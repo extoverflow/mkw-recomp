@@ -78,6 +78,7 @@ typedef struct {
     uint16_t ww[CHUNK / KP];         // per 16 KiB page: WW_ON, the written 4 KiB pages, those being unmarked
     uint8_t backed[CHUNK / KP / 8];  // per 16 KiB page: direct memory mapped there
     int64_t *phys;                   // per 16 KiB page: its direct memory; made on the first backing in the chunk
+    uint8_t gpu[CHUNK / KP / 8];     // per 16 KiB page: the GPU may read it (an imported pool): never given back
 } Chunk;
 
 static Chunk *chunks[NCHUNK];
@@ -140,6 +141,7 @@ static int ww_hot_wanted(void) {
     return on;
 }
 static uint64_t st_hot_made, st_hot_aged;   // pages made hot, hot pages closed again by age
+static uint64_t st_gpu_shared, st_gpu_backed, st_gpu_kept;   // ps5_mem_gpu_share: pages marked, backed there, kept
 
 // The fault on a write to a watched page: all four marked written, the page may open (vm_lock held).
 static void ww_mark(uint64_t k) {
@@ -175,9 +177,19 @@ static uint64_t st_regions, st_region_blocks;
 static int64_t st_guest_now;   // bytes of guest memory backed right now (backed less given back)
 static inline void st_add(uint64_t *v, uint64_t d) { __atomic_fetch_add(v, d, __ATOMIC_RELAXED); }
 
+// The GPU's access bits of a mapping (as PS5_Mesa's RADV_PS5_PROTECTION, radv_ps5_platform.c:207-209, and Pokopia's
+// platform_prospero.cpp:48-60, ref/). Guest memory is GPU memory too: the runtime imports the game's CPU-visible pools
+// (vk_mem_back.c import_pool) and the GPU reads them at the CPU's address. On Linux an imported page stays the GPU's
+// whatever the CPU's protection; here every guest page carries GPU read and write while the CPU may touch it at all,
+// so a write-watch close or a page backed after the import never takes the GPU's access away (play test p5, run 55:
+// "GPU Protection fault … Unmapped page access" at 0x1182911000 in the alias region, GPU_FAULT_PAGE_FAULT_ASYNC, the
+// title killed after 36 min).
+#define PROT_GPU_RW 0x30   // GPU read 0x10, GPU write 0x20
+int sceKernelMprotect(const void *addr, size_t len, int prot);
+
 static int kprot(void *a, size_t n, int prot) {   // mprotect, counted
     uint64_t t0 = plat_now_ns();
-    int r = mprotect(a, n, prot);
+    int r = sceKernelMprotect(a, n, prot ? prot | PROT_GPU_RW : prot);
     st_add(&st_kprot_n, 1), st_add(&st_kprot_ns, plat_now_ns() - t0);
     return r;
 }
@@ -195,7 +207,7 @@ static int back_run(uint64_t k, uint64_t n) {
     void *at = (void *)(uintptr_t)k;
     size_t align = n >= BLOCK ? BLOCK : KP;
     int ra = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), n, align, DMEM_TYPE, &phys), rm = 0;
-    if (!ra) rm = sceKernelMapDirectMemory(&at, n, PROT_READ | PROT_WRITE, MAP_FIXED, phys, align);
+    if (!ra) rm = sceKernelMapDirectMemory(&at, n, PROT_READ | PROT_WRITE | PROT_GPU_RW, MAP_FIXED, phys, align);
     if (ra || rm || at != (void *)(uintptr_t)k) {
         st_add(n >= BLOCK ? &st_block_fail : &st_page_fail, 1);
         if (n < BLOCK) {   // the last failed page, for the memory line (no output from a signal handler)
@@ -259,6 +271,13 @@ static void unback(uint64_t k) {
     Chunk *c = chunk_of(k, 0);
     size_t i = (k % CHUNK) / KP;
     if (!c || !(c->backed[i / 8] >> (i % 8) & 1)) return;
+    if (c->gpu[i / 8] >> (i % 8) & 1) {   // the GPU may still read it: kept and zeroed (decommitted pages read zero)
+        kprot((void *)(uintptr_t)k, KP, PROT_READ | PROT_WRITE);
+        memset((void *)(uintptr_t)k, 0, KP);
+        c->ww[i] &= (uint16_t)WW_ON;
+        st_add(&st_gpu_kept, 1);
+        return;
+    }
     void *at = (void *)(uintptr_t)k;
     st_add(&st_unback_n, 1);
     __atomic_sub_fetch(&st_guest_now, (int64_t)KP, __ATOMIC_RELAXED);
@@ -545,6 +564,27 @@ void ps5_mem_prepare_write(uint64_t a, uint64_t n) {
     plat_mutex_unlock(&vm_lock);
 }
 
+// [a, a + n) becomes GPU memory (vk_mem_back.c import_pool, before the import): every 16 KiB page of it that is ours is
+// backed now, as the GPU does not fault into the handler that backs pages at the CPU's first touch (Pokopia backs a
+// range before importing it, paged_vm.cpp:545-605 in ref/Pokopia-Native-PS5), and marked so it is never given back.
+void ps5_mem_gpu_share(uint64_t a, uint64_t n) {
+    if (!n) return;
+    plat_mutex_lock(&vm_lock);
+    for (uint64_t k = a & ~(KP - 1); k < a + n && k < PS_LIMIT; k += KP) {
+        int any = 0;
+        for (uint64_t i = 0; i < SUB; i++) any |= st_get(k + i * PG) >= PS_NONE;
+        if (!any) continue;   // not committed: nothing to back (the GPU should not read it either)
+        if (!is_backed(k)) {
+            if (!back(k, kpage_prot(k))) break;   // out of memory: the import goes on, a GPU read there would fault
+            st_add(&st_gpu_backed, 1);
+        }
+        Chunk *c = chunk_of(k, 0);
+        size_t i = (k % CHUNK) / KP;
+        if (c && !(c->gpu[i / 8] >> (i % 8) & 1)) c->gpu[i / 8] |= (uint8_t)(1u << (i % 8)), st_add(&st_gpu_shared, 1);
+    }
+    plat_mutex_unlock(&vm_lock);
+}
+
 // Whether the guest may write every 4 KiB page of [a, a + n) (committed read-write, or a lazily backed range), and
 // (diagnosis) the state and the kernel protection of the first page where the kernel page itself refuses writes.
 int ps5_mem_writable(uint64_t a, uint64_t n, char *why, size_t cap) {
@@ -806,7 +846,7 @@ int ps5_mem_stats(char *out, size_t cap) {
                     "faults %llu (first touch %llu, write watch %llu, other %llu) %.2f s in all; backing %llu calls %.1f MiB "
                     "%.2f s (2 MiB blocks failed %llu, pages failed %llu; last %#llx states %#llx allocate %#x map %#x; hook "
                     "retried unbacked %llu; unback %llu, re-reserve failed %llu (%#x), release failed %llu (%#x)); mprotect %llu %.2f s; fault lock waits %.2f s; write-watch queries %llu, "
-                    "%.1f GiB, %.2f s; hot pages made %llu, closed again %llu",
+                    "%.1f GiB, %.2f s; hot pages made %llu, closed again %llu; GPU pages shared %llu (backed there %llu), kept on decommit %llu",
                     (unsigned long long)fn, (unsigned long long)st_fault_touch, (unsigned long long)st_fault_ww,
                     (unsigned long long)st_fault_other, st_fault_ns / 1e9, (unsigned long long)bn,
                     st_back_bytes / 1048576.0, st_back_ns / 1e9, (unsigned long long)st_block_fail,
@@ -815,5 +855,5 @@ int ps5_mem_stats(char *out, size_t cap) {
                     (unsigned long long)st_unback_n, (unsigned long long)st_unback_fail, (unsigned)st_unback_r,
                     (unsigned long long)st_release_fail, (unsigned)st_release_r, (unsigned long long)kn,
                     st_kprot_ns / 1e9, st_lockwait_ns / 1e9, (unsigned long long)st_ww_n, st_ww_bytes / 1073741824.0,
-                    st_ww_ns / 1e9, (unsigned long long)st_hot_made, (unsigned long long)st_hot_aged);
+                    st_ww_ns / 1e9, (unsigned long long)st_hot_made, (unsigned long long)st_hot_aged, (unsigned long long)st_gpu_shared, (unsigned long long)st_gpu_backed, (unsigned long long)st_gpu_kept);
 }

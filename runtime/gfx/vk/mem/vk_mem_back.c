@@ -188,6 +188,12 @@ static int import_host(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     r->import_hi = (addr + size + al - 1) & ~(al - 1);
     uint64_t n = r->import_hi - r->import_lo;
     mem_commit_range(r->import_lo, n);   // the driver pins the pages: they must exist (Windows' lazy commit, memory.c)
+#ifdef __PROSPERO__
+    // The PS5 backs guest pages at the CPU's first touch, which the GPU does not make: the range is backed now and its
+    // pages kept while imported (platform/ps5_mem.c ps5_mem_gpu_share).
+    extern void ps5_mem_gpu_share(uint64_t a, uint64_t n);
+    ps5_mem_gpu_share(r->import_lo, n);
+#endif
     VkMemoryHostPointerPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     VkResult res = p_host_props ? p_host_props(c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                                (void *)(uintptr_t)r->import_lo, &hp)
