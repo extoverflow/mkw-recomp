@@ -354,6 +354,7 @@ static const CfgRow rows[] = {
     K("TEMPORAL_KART_CIRCLE"),
     K("TEMPORAL_KART_DEPTH"),
     K("TEMPORAL_NGX"),
+    K("TEX_LARGE"),
     K("TEX_OVERWRITTEN"),
     K("TEX_PRESSURE"),
     K("TEX_RACE_PURGE"),
@@ -548,6 +549,8 @@ static const struct { const char *key, *value; } PS5[] = {
     // The GPU's cap stays 4 GiB: upstream's integrated default (40 % of the RAM, 46a3c2e #174) gives 4864 MiB from the
     // title's 12 GiB, the same pool the guest's memory comes from (rebased run 73: 1.1 GB less free at 9 min than run 72).
     {"GPU_MEM_LIMIT", "4096"},
+    // Map-sized textures (just under 8192 texels) cut to 4096 a side: at full size they did not fit the cap (run 87).
+    {"TEX_LARGE", "4096"},
 };
 static int profile = -1;   // 0 none, 1 Steam Deck, 2 PS5
 
