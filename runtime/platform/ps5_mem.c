@@ -358,6 +358,10 @@ void *plat_mem_alloc(size_t n) {
     return ok ? at : NULL;
 }
 
+// Windows lazy commit (memory.c lazy_fault): not needed here, the fault handler backs a committed page at its first
+// touch as Linux does (linux_mem.c:270 plat_mem_lazy_hook, a no-op).
+void plat_mem_lazy_hook(int (*fn)(uint64_t addr)) { (void)fn; }
+
 int plat_mem_commit(uint64_t addr, size_t n) {
     plat_mutex_lock(&vm_lock);
     st_set(addr, n, PS_RW);
