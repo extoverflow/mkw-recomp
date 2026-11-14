@@ -230,6 +230,8 @@ uint64_t gfx_replayed_submits(void) {
     return v;
 }
 
+void nvn_pin_sweep_point(void);   // nvn_api_cmd.c
+
 static uint64_t submit_sync(const uint64_t *handles, int n) {
     vk_sync_start();
     vk_present_drain();
@@ -408,6 +410,7 @@ static void replay_main(void *arg) {
             vk_tex_reg_limit = it.reg_at;
             uint64_t f = submit_sync(it.h, it.n);
             vk_tex_reg_limit = 0;
+            nvn_pin_sweep_point();   // the replay state is this thread's (nvn_api_cmd.c)
             vk_tl_replay(it.value, 1);
             if (f != it.value)
                 rt_fatal("vk: replayed submission signalled %llu, queued as %llu", (unsigned long long)f,
@@ -689,7 +692,11 @@ static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEAS
 // Asynchronous: the handles (nvn_submit_prepare_async ran under the front end's submit lock) are copied and queued;
 // the value returned is the one the replay will signal.
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {
-    if (!gfx_replay_async()) return submit_sync(handles, n);
+    if (!gfx_replay_async()) {
+        uint64_t f = submit_sync(handles, n);
+        nvn_pin_sweep_point();
+        return f;
+    }
     vk_sync_start();
     ReplayItem it = {.kind = RI_SUBMIT, .n = n, .submit_no = nvn_submit_count()};
     vk_mem_shadow_capture(it.submit_no);   // before the replay can sync for it
