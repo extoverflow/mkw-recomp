@@ -326,6 +326,9 @@ static const struct { const char *key, *value; } PS5[] = {
     // pages invalidates the buffer, vk_mem_shadow.c:16-23) the PS5 does not have; the guest's pages carry the GPU bits
     // (ps5_mem.c). Races 20-30 -> ~45 fps and 528 MiB of GPU memory back (runs 57 and 60, 13/11/2026).
     {"SHADOW", "0"},
+    // The GPU's cap stays 4 GiB: upstream's integrated default (40 % of the RAM, 46a3c2e #174) gives 4864 MiB from the
+    // title's 12 GiB, the same pool the guest's memory comes from (rebased run 73: 1.1 GB less free at 9 min than run 72).
+    {"GPU_MEM_LIMIT", "4096"},
 };
 static int profile = -1;   // 0 none, 1 Steam Deck, 2 PS5
 
