@@ -46,3 +46,9 @@ int input_hack_key(int which) {
 
 // ---- start screen (launcher.cpp): none; straight into the mode asked for
 int launcher_run(void) { return LAUNCHER_PLAY; }
+// The paths main.c hands the launcher's pages (upstream 8dd7801: the Profiles and Mods pages, a GameBanana 1-Click link):
+// no launcher on the PS5, so they are not kept.
+void launcher_set_romfs(const char *romfs) { (void)romfs; }
+void launcher_set_profile(const char *profile) { (void)profile; }
+void launcher_set_exefs(const char *exefs) { (void)exefs; }
+void launcher_gb_install(const char *url) { (void)url; }
