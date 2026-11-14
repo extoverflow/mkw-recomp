@@ -49,6 +49,13 @@ size_t plat_getenv(const char *name, char *out, size_t cap) {
 // read-only. A payload has neither: 0.
 #define PS5_TITLE_EXE "/app0/eboot.bin"
 
+// A URL scheme handler (GameBanana 1-Click; linux_sys.c:594 writes an xdg .desktop file): the PS5 has no desktop to
+// register one with, so none is made (0, as linux_sys.c returns when it cannot).
+int plat_url_scheme(const char *scheme, const char *label, const char *exe, const char *arg) {
+    (void)scheme, (void)label, (void)exe, (void)arg;
+    return 0;
+}
+
 int plat_exe_path(char *out, size_t cap) {
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
     size_t n = cap;
