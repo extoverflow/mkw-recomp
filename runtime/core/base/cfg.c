@@ -51,7 +51,7 @@ static const char *const known[] = {
     "BIND_XF", "REG_LATE", "REG_QUEUED", "REPLAY_ASYNC", "USNAP_CMP",
     "REPLAY_CHECK", "RESOLUTION", "RESOLUTION_3D", "RESOLVE_CHECK", "ROMFS", "RTSTATS", "ROMFS_MODS", "ROMFS_PATCHES",
     "RUMBLE", "RUMBLE_CURVE", "RUMBLE_STRENGTH", "RUMBLE_TRIGGERS",
-    "SHADER_MEMO", "SHADOW_SIZE", "SHARED_FONTS", "SHARPNESS", "SHORTCUT_ASKED", "SHOTS", "SHOTS_DIR", "SHOTS_FULL", "SPARSE_IMAGES", "SPARSE_MIB", "SPARSE_NO_BUFFER", "SPIN", "SPIN_HANDOFF_US", "SPLIT_DRAWS", "SPLIT_US", "STEAM_X11", "STICK_DEADZONE", "SWITCH2", "SWKBD_ANSWER",
+    "SHADER_MEMO", "SHADOW", "SHADOW_SIZE", "SHARED_FONTS", "SHARPNESS", "SHORTCUT_ASKED", "SHOTS", "SHOTS_DIR", "SHOTS_FULL", "SPARSE_IMAGES", "SPARSE_MIB", "SPARSE_NO_BUFFER", "SPIN", "SPIN_HANDOFF_US", "SPLIT_DRAWS", "SPLIT_US", "STEAM_X11", "STICK_DEADZONE", "SWITCH2", "SWKBD_ANSWER",
     "SKIP_PROGRAMS", "SWKBD_TEST", "TEX_ALIAS", "TEX_MEMO", "TEX_QUALITY", "TEX_OVERWRITTEN", "TEX_RELEASED_MIB", "TIMER_1MS", "TRACE", "TURBO", "TURBO_SPEED", "SKIP_MOVIES", "SEED", "UNLOCK_ALL", "QUICK_RACE", "FREEZE_KEYS", "QUALITY", "TRACE_UBO", "TRACE_UBO_OUT", "UBO_SNAPSHOT", "UPSCALER", "VRR", "VK_DYN_A2C", "VK_DYN_VERTEX", "VK_NO_FLOAT64",
     "VK_PRESENT", "VK_RECORDER", "VK_SSBO_ALIGN", "VK_SUBGROUP", "VK_SUBGROUP_PIN", "VK_TEX_POOL_MIN", "VK_VALIDATION", "VOLUME", "VRAM_HEADROOM", "VRAM_LOG", "VRAM_MARGIN", "VS_OUTS",
     "UPDATE_AS", "UPDATE_CHECK", "UPDATE_REPO", "START_SCREEN", "WINDOW_SIZE", "ZSTD_CHECK", "ZSTD_NATIVE",
@@ -322,6 +322,10 @@ static const struct { const char *key, *value; } PS5[] = {
     {"RESOLUTION", "1080"}, {"RESOLUTION_3D", "original"},
     // The pipeline cache saved every 10 min instead of 20 s: 22 MB a save spent the title's write budget in ~20 min.
     {"PIPE_AUTOSAVE_S", "600"},
+    // CPU-visible pools imported, no shadow copies: the shadows exist for a Linux amdgpu cost (re-protecting imported
+    // pages invalidates the buffer, vk_mem_shadow.c:16-23) the PS5 does not have; the guest's pages carry the GPU bits
+    // (ps5_mem.c). Races 20-30 -> ~45 fps and 528 MiB of GPU memory back (runs 57 and 60, 13/11/2026).
+    {"SHADOW", "0"},
 };
 static int profile = -1;   // 0 none, 1 Steam Deck, 2 PS5
 
