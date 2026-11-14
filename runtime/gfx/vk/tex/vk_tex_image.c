@@ -25,7 +25,12 @@
 // 1.7 GiB on a GPU with sparse images, and the render targets failed after them (black race). The game copies only
 // levels 3-11 into the arrays; their top levels were zero without sparse binding anyway. The image's level 0 is NVN level
 // drop (VkTexImage.drop); sampling picks its levels from the smaller size as on a smaller texture.
-static uint32_t tex_drop(VkImageType type, uint32_t w, uint32_t h, uint32_t levels, uint32_t samples) {
+static int format_compressed(VkFormat f) {   // vkCmdClearColorImage takes no block-compressed format
+    return (f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) ||
+           (f >= VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK && f <= VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK);
+}
+
+static uint32_t tex_drop(VkImageType type, uint32_t w, uint32_t h, uint32_t levels, uint32_t samples, int compressed) {
     static int64_t limit = -1;
     if (limit < 0) {
         const char *e = cfg_get("MKW_TEX_MAX");
@@ -33,9 +38,25 @@ static uint32_t tex_drop(VkImageType type, uint32_t w, uint32_t h, uint32_t leve
         limit = e && *e ? atoll(e) : c && c->props.vendorID == 0x5143 ? 1024 : 0;
         if (limit > 0) rt_log("vk: textures of 8192 texels or more cut to %lld (MKW_TEX_MAX)", (long long)limit);
     }
+    // MKW_TEX_LARGE=<texels> (0 = off; the PS5 profile 4096): any other block-compressed 2D image with a side above it loses its top
+    // levels until it fits. On the PS5 the world map's 8008x8164 and 7640x7664 ASTC images (13 levels, 85 and 76 MiB as
+    // BC7) are below MKW_TEX_MAX's 8192; the game makes them again at each map screen and under the 4 GiB cap they failed
+    // (run 87 at 97 and 110 min; the map screen between races showed without its background). Cut to 4004x4082
+    // (run 88, 2 h): none failed, the map showed its background, and they are still sharper than the 1080-line screen.
+    static int64_t large = -1;
+    if (large < 0) {
+        const char *e = cfg_get("MKW_TEX_LARGE");
+        large = e && *e ? atoll(e) : 0;
+        if (large > 0) rt_log("vk: 2D textures over %lld texels a side cut to fit (MKW_TEX_LARGE)", (long long)large);
+    }
     uint32_t side = w > h ? w : h, drop = 0;
-    if (limit <= 0 || type != VK_IMAGE_TYPE_2D || samples > 1 || side < 8192) return 0;
-    while ((side >> drop) > (uint64_t)limit && drop + 1 < levels && drop < 15) drop++;
+    if (type != VK_IMAGE_TYPE_2D || samples > 1) return 0;
+    if (limit > 0 && side >= 8192) {
+        while ((side >> drop) > (uint64_t)limit && drop + 1 < levels && drop < 15) drop++;
+        return drop;
+    }
+    if (large > 0 && compressed)   // block-compressed only: never a render target (a 6144x6144 shadow map is one)
+        while ((side >> drop) > (uint64_t)large && drop + 1 < levels && drop < 15) drop++;
     return drop;
 }
 
@@ -54,10 +75,6 @@ static VkImageAspectFlags aspect_of(const TexVkFormat *f) {
 
 // Binds img into the pool memory behind its GPU address (physical pools, virtual pools through the page table) when
 // the memory type, alignment and contiguous size allow; 0 otherwise.
-static int format_compressed(VkFormat f) {   // vkCmdClearColorImage takes no block-compressed format
-    return (f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) ||
-           (f >= VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK && f <= VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK);
-}
 
 static int bind_pool_memory(VkCtx *c, Tex *e, VkImage img) {
     VkMemoryRequirements req;
@@ -543,7 +560,7 @@ Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     if (levels > most) levels = most;
     uint32_t samples = d->samples > 1 ? (uint32_t)d->samples : 1;
     if (samples > 1) levels = 1;
-    uint32_t drop = tex_drop(type, w, h, levels, samples);
+    uint32_t drop = tex_drop(type, w, h, levels, samples, f.astc_bw != 0 || format_compressed(f.vk));
     if (drop) w = umax(w >> drop, 1), h = umax(h >> drop, 1), levels -= drop;
     VkFormatFeatureFlags ff = features_of(f.vk);
     VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
