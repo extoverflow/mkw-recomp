@@ -255,13 +255,24 @@ static void pt_watch(void *arg) {
 
 // The memory line every 30 s, on a thread of its own: it takes the log stream's and the heap's locks, and a thread
 // stopped holding one of them would otherwise stop the thread dump too (play test p4).
+extern int ps5_alloc_trace_on;                          // ps5_alloc_trace.c
+int ps5_alloc_trace_report(FILE *f, int top);
+
 static void mem_watch(void *arg) {
     (void)arg;
     if (!ps5_heap_trim) fprintf(stderr, "[host] ps5: the platform heap has no ps5_heap_trim (older SDK): not trimmed\n");
     for (int tick = 1;; tick++) {
         plat_sleep_ms(10000);
+        if (tick == 1) {   // args.txt reaches the environment after this thread starts (run 66: never on)
+            const char *e = getenv("MKW_PS5_ALLOC_TRACE");
+            if (e && !strcmp(e, "1")) {
+                ps5_alloc_trace_on = 1;
+                fprintf(stderr, "[host] ps5: allocation trace on (MKW_PS5_ALLOC_TRACE): live sampled allocations by call site every 5 min\n");
+            }
+        }
         if (ps5_heap_trim) ps5_heap_trim();
         if (tick % 3 == 0) memory_report("every 30 s");
+        if (tick % 30 == 15 && ps5_alloc_trace_on) ps5_alloc_trace_report(stderr, 25);   // every 5 min (MKW_PS5_ALLOC_TRACE)
         if (tick % 12 == 6) {   // every 2 min: how much of the guest's backed memory reads zero (todo.md, 2-hour goal)
             char z[320];
             ps5_mem_zero_census(z, sizeof z);
