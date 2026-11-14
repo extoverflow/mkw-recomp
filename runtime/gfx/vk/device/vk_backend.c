@@ -593,9 +593,23 @@ static int vk_be_pool_init(pool_t *p) { vk_sync_start(); return vk_pool_init(p);
 // Only a pool whose GPU storage is guest memory drains the replay queue: the guest gets that storage back on return. The
 // others leave the index now and their storage goes once the GPU is done with what was submitted (vk_pool_fini); the game frees
 // a pool only after waiting for the GPU's last use of it. Draining cost ~24 ms per finalize while loading (live35).
+// MKW_IMPORT_FINI_DRAIN=0 (a measurement; default 1): an imported pool's finalize does not drain either, on the same NVN
+// rule. With the PS5 profile's MKW_SHADOW=0 every CPU-visible pool is an import, and the drains cost the game thread
+// 9,545 waits, 106 s in ~4 h of play (run 87, ~11 ms each). vk_memory.c counts a queued replay that still names a
+// finalized pool (gone hits): the measure of whether the rule holds here. Run 88 (2 h, =0): 0 waits and 0 gone hits,
+// but no smoother (1% low 19.5 fps against run 87's 22.0 over the same minutes): kept as a switch, the default drains.
+static int import_fini_drain(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("MKW_IMPORT_FINI_DRAIN");
+        on = !(e && !strcmp(e, "0"));
+        if (!on) rt_log("vk: imported pools finalize without draining the replay queue (MKW_IMPORT_FINI_DRAIN=0)");
+    }
+    return on;
+}
 static void vk_be_pool_fini(pool_t *p) {
     vk_sync_start();
-    if (vk_pool_needs_drain(p)) replay_drain(DR_POOL_FINI);
+    if (import_fini_drain() && vk_pool_needs_drain(p)) replay_drain(DR_POOL_FINI);
     else if (gfx_replay_async()) {
         plat_mutex_lock(&rl);
         dr_calls[DR_POOL_FINI]++, dr_tcalls[DR_POOL_FINI]++;
