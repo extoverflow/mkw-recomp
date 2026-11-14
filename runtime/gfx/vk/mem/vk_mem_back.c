@@ -125,6 +125,10 @@ static void placed_release(VkCtx *c, PoolRec *r) {
 }
 
 // CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host).
+#ifdef __PROSPERO__
+void ps5_mem_gpu_unshare(uint64_t a, uint64_t n);   // platform/ps5_mem.c
+#endif
+
 int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     if (c->has_placed && placed_pool(c, r, addr, size)) return 1;
     // A pool whose copy does not fit (MKW: one of 2.4 GB, flags 0x24, over MKW_GPU_MEM_LIMIT; run77-run78 died on it)
@@ -150,6 +154,9 @@ int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     // pages kept while imported (platform/ps5_mem.c ps5_mem_gpu_share).
     extern void ps5_mem_gpu_share(uint64_t a, uint64_t n);
     ps5_mem_gpu_share(r->import_lo, n);
+#define PS5_UNSHARE(a, n) ps5_mem_gpu_unshare((a), (n))   // a failed import gives its pages back to the count
+#else
+#define PS5_UNSHARE(a, n) ((void)0)
 #endif
     VkMemoryHostPointerPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     VkResult res = p_host_props ? p_host_props(c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
@@ -157,6 +164,7 @@ int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
                                 : VK_ERROR_EXTENSION_NOT_PRESENT;
     if (res != VK_SUCCESS || !hp.memoryTypeBits) {
         rt_log("vk: pool %#llx+%#llx: host pointer not importable (%d)", (unsigned long long)addr, (unsigned long long)size, (int)res);
+        PS5_UNSHARE(r->import_lo, n);
         return 0;
     }
     VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
@@ -165,6 +173,7 @@ int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
                              .usage = pool_usage(c), .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     if ((res = vkCreateBuffer(c->device, &bi, NULL, &r->buf)) != VK_SUCCESS) {
         rt_log("vk: pool %#llx: vkCreateBuffer for the import failed (%d)", (unsigned long long)addr, (int)res);
+        PS5_UNSHARE(r->import_lo, n);
         return 0;
     }
     VkMemoryRequirements req;
@@ -177,6 +186,7 @@ int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
                (unsigned long long)n);
         vkDestroyBuffer(c->device, r->buf, NULL);
         r->buf = VK_NULL_HANDLE;
+        PS5_UNSHARE(r->import_lo, n);
         return 0;
     }
     VkImportMemoryHostPointerInfoEXT im = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
@@ -191,6 +201,7 @@ int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
         vkDestroyBuffer(c->device, r->buf, NULL);
         r->buf = VK_NULL_HANDLE;
         r->mem = VK_NULL_HANDLE;
+        PS5_UNSHARE(r->import_lo, n);
         return 0;
     }
     plat_inc32(&n_imports);
@@ -365,7 +376,13 @@ void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->salloc) vmaDestroyBuffer(c->vma, r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
     if (r->placed) placed_release(c, r);
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
+#ifdef __PROSPERO__
+    int imported = r->mem && !r->placed;   // import_pool's: its pages were shared with the GPU
+#endif
     if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
+#ifdef __PROSPERO__
+    if (imported) ps5_mem_gpu_unshare(r->import_lo, r->import_hi - r->import_lo);
+#endif
     for (uint32_t i = 0; i < r->nchunks; i++) {
         if (r->chunks[i].buf) vkDestroyBuffer(c->device, r->chunks[i].buf, NULL);
         if (r->chunks[i].alloc) vmaFreeMemory(c->vma, r->chunks[i].alloc);
