@@ -477,21 +477,26 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
         }
         uint16_t *w = ww_of(k);
         if (*w & WW_HOT) {   // open: every committed 4 KiB page of it counts as written
+            uint8_t rep = 0;
             for (uint64_t i = 0; i < SUB && got < max; i++) {
                 uint64_t p = k + i * PG;
-                if (p >= addr && p < end && st_get(p) >= PS_NONE) pages[got++] = p;
+                if (p >= addr && p < end && st_get(p) >= PS_NONE) pages[got++] = p, rep |= (uint8_t)(1u << i);
             }
             if (!reset) continue;
             int age = ww_score(*w) + 1;
-            if (age < WW_HOT_AGE) {
-                *w = ww_with_score(*w, age);
+            if (age < WW_HOT_AGE || !rep) {
+                *w = ww_with_score(*w, age < WW_HOT_AGE ? age : WW_HOT_AGE - 1);
                 continue;
             }
-            // closed again to see whether the game still writes it (a write since faults and marks it as usual)
-            *w = (uint16_t)(*w & WW_ON);
+            // Closed again to see whether the game still writes it (a write since faults and marks it as usual), as
+            // the closing below for a wholly marked page: closed first, then only what this query reported unmarked.
+            // The 4 KiB pages it did not report (outside [addr, end), or past max) stay marked written: clearing the
+            // whole page here lost the writes made to them since the last query that covered them (run 91, hot pages
+            // on: flicker and geometry spikes near other karts, the course map without its coloured layer).
+            *w = (uint16_t)(WW_ON | WW_ALL | ((unsigned)rep << WW_PEND_SHIFT));
             st_add(&st_hot_aged, 1);
             if (is_backed(k)) {
-                int prot = kpage_prot(k);
+                int prot = kpage_prot(k) & ~PROT_WRITE;
                 if (run_end != k || run_prot != prot) {
                     ww_close_run(run, run_end, run_prot);
                     run = k, run_prot = prot;
