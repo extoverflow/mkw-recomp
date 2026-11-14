@@ -79,6 +79,7 @@ typedef struct {
     uint8_t backed[CHUNK / KP / 8];  // per 16 KiB page: direct memory mapped there
     int64_t *phys;                   // per 16 KiB page: its direct memory; made on the first backing in the chunk
     uint8_t gpu[CHUNK / KP / 8];     // per 16 KiB page: the GPU may read it (an imported pool): never given back
+    uint8_t zseen[CHUNK / KP / 8];   // per 16 KiB page: read zero at the last census (ps5_mem_zero_census)
 } Chunk;
 
 static Chunk *chunks[NCHUNK];
@@ -813,6 +814,91 @@ int plat_mem_replace_anon(uint64_t addr, uint64_t n) {
 }
 
 uint64_t ps5_mem_sibling_lifts(void) { return __atomic_load_n(&sibling_lifts, __ATOMIC_RELAXED); }
+
+// Zero-page census (measurement for the 2-hour goal, 13/11/2026): of the guest's backed 16 KiB pages, how many read
+// all zero right now, split by what giving them back would have to respect (a page the GPU may read, a watched one).
+// Guest memory only grows (39-51 min to the pool's end, runs 57 and 60); a page that reads zero could be released and
+// backed again, zeroed, at its next touch, as a kernel's shared zero page. The lock is taken per 2 MiB, so faulting
+// threads wait at most one 2 MiB scan; pages the guest cannot read (PROT_NONE) are skipped, never touched.
+// MKW_PS5_ZERO_RECLAIM (on; 0 turns it off): a page that read zero at two censuses in a row is given back (unback: reserved again, its
+// direct memory released; the next touch backs it zeroed, so the guest reads the same bytes). Not given back: pages
+// the GPU may read (kept, as on decommit), hot pages, and watched pages with written or pending marks (a write the
+// write watch has not reported yet would be lost; with none, the page read zero when last reported and reads zero
+// after, so nothing changed for the GPU side).
+static int page_zero(const uint64_t *p) {
+    for (size_t i = 0; i < KP / 8; i += 8)
+        if (p[i] | p[i + 1] | p[i + 2] | p[i + 3] | p[i + 4] | p[i + 5] | p[i + 6] | p[i + 7]) return 0;
+    return 1;
+}
+
+static uint64_t st_zero_given;   // pages given back by the census, in all
+
+static int zero_reclaim_wanted(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("MKW_PS5_ZERO_RECLAIM");   // on unless 0 (runs 63, 65, 69: ~600 MiB given back)
+        on = !(e && !strcmp(e, "0"));
+    }
+    return on;
+}
+
+int ps5_mem_zero_census(char *out, size_t cap) {
+    uint64_t t0 = plat_now_ns(), backed = 0, zero = 0, zero_gpu = 0, zero_watched = 0, unreadable = 0, given = 0,
+             zero_shut = 0;
+    static int peek_shut = -1;   // MKW_PS5_ZERO_PEEK=1: no-access pages are tested too (run 64 stalled with it: suspect)
+    if (peek_shut < 0) {
+        const char *e = getenv("MKW_PS5_ZERO_PEEK");
+        peek_shut = e && !strcmp(e, "1");
+    }
+    int reclaim = zero_reclaim_wanted();
+    for (size_t ci = 0; ci < NCHUNK; ci++) {
+        Chunk *c = chunks[ci];
+        if (!c) continue;
+        for (uint64_t b = 0; b < CHUNK; b += BLOCK) {
+            size_t i0 = b / KP, i1 = (b + BLOCK) / KP, any = 0;
+            for (size_t i = i0; i < i1 && !any; i += 8) any = c->backed[i / 8];
+            if (!any) continue;
+            plat_mutex_lock(&vm_lock);
+            for (size_t i = i0; i < i1; i++) {
+                if (!(c->backed[i / 8] >> (i % 8) & 1)) continue;
+                uint64_t k = (uint64_t)ci * CHUNK + (uint64_t)i * KP;
+                backed++;
+                uint8_t bit = (uint8_t)(1u << (i % 8));
+                int shut = !(kpage_prot(k) & PROT_READ);
+                if (shut) {   // a page the guest cannot read (41k pages at 40 min, run 63): opened to read here alone
+                    unreadable++;
+                    if (!peek_shut) { c->zseen[i / 8] &= (uint8_t)~bit; continue; }
+                    kprot((void *)(uintptr_t)k, KP, PROT_READ);
+                }
+                int z = page_zero((const uint64_t *)(uintptr_t)k);
+                if (shut) apply(k);   // its protection back (vm_lock held: no guest access saw it open)
+                if (!z) { c->zseen[i / 8] &= (uint8_t)~bit; continue; }
+                zero++;
+                if (shut) zero_shut++;
+                int gpu = c->gpu[i / 8] & bit, w = c->ww[i];
+                if (gpu) zero_gpu++;
+                else if (w & WW_ON) zero_watched++;
+                int marks = (w & WW_ON) && (w & (WW_HOT | WW_ALL | (WW_ALL << WW_PEND_SHIFT)));
+                if (reclaim && (c->zseen[i / 8] & bit) && !gpu && !marks) {
+                    unback(k);   // clears backed; ww keeps WW_ON only
+                    c->zseen[i / 8] &= (uint8_t)~bit;
+                    given++;
+                    continue;
+                }
+                c->zseen[i / 8] |= bit;
+            }
+            plat_mutex_unlock(&vm_lock);
+        }
+    }
+    st_zero_given += given;
+    return snprintf(out, cap, "zero census: %llu of %llu backed 16 KiB pages read zero (%.1f of %.1f MiB): GPU-shared %llu, "
+                    "watched %llu, other %llu; unreadable %llu (zero %llu); given back now %llu (%.1f MiB), in all %.1f MiB%s; %.0f ms",
+                    (unsigned long long)zero, (unsigned long long)backed, zero * (KP / 1048576.0), backed * (KP / 1048576.0),
+                    (unsigned long long)zero_gpu, (unsigned long long)zero_watched,
+                    (unsigned long long)(zero - zero_gpu - zero_watched), (unsigned long long)unreadable,
+                    (unsigned long long)zero_shut, (unsigned long long)given, given * (KP / 1048576.0), st_zero_given * (KP / 1048576.0),
+                    reclaim ? "" : " (MKW_PS5_ZERO_RECLAIM off)", (plat_now_ns() - t0) / 1e6);
+}
 
 // The counters above as one line for the title's memory report (ps5_main.c).
 // One short line for the page-table sampler (ps5_main.c pt_watch): guest backing so far.
