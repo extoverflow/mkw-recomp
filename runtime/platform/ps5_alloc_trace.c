@@ -75,10 +75,13 @@ static void at_add(void *p, size_t size, uintptr_t ret) {
         if (__atomic_add_fetch(&at_count, 1, __ATOMIC_RELAXED) % AT_EVERY) return;
         weight = AT_EVERY;
     }
-    if (!at_tab) {   // made once, from the platform heap's libc fallback: never traced itself
+    if (!at_tab) {   // made once, from the title heap directly (ps5_heap_calloc is not wrapped: never traced itself)
         static volatile int made;
         if (!__atomic_exchange_n(&made, 1, __ATOMIC_ACQ_REL)) {
-            AtRec *t = __real_calloc(AT_CAP, sizeof *t);
+            // Not libc's calloc: its 12 MiB came from the system's small libc heap, the memory libkernel's threads take
+            // theirs from: "[ScePthread/System] Internal Memory is running out." and "svc 0x10 on a host thread" in
+            // every run with the trace on once that heap was tight (PS5 runs 76-80, 86; none without it, 81-85).
+            AtRec *t = ps5_heap_calloc(AT_CAP, sizeof *t);
             __atomic_store_n(&at_tab, t, __ATOMIC_RELEASE);
         }
         if (!__atomic_load_n(&at_tab, __ATOMIC_ACQUIRE)) return;
