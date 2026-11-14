@@ -78,7 +78,7 @@ typedef struct {
     uint16_t ww[CHUNK / KP];         // per 16 KiB page: WW_ON, the written 4 KiB pages, those being unmarked
     uint8_t backed[CHUNK / KP / 8];  // per 16 KiB page: direct memory mapped there
     int64_t *phys;                   // per 16 KiB page: its direct memory; made on the first backing in the chunk
-    uint8_t gpu[CHUNK / KP / 8];     // per 16 KiB page: the GPU may read it (an imported pool): never given back
+    uint8_t gpu[CHUNK / KP];         // per 16 KiB page: imports covering it (ps5_mem_gpu_share/unshare); not given back while >0
     uint8_t zseen[CHUNK / KP / 8];   // per 16 KiB page: read zero at the last census (ps5_mem_zero_census)
 } Chunk;
 
@@ -272,7 +272,7 @@ static void unback(uint64_t k) {
     Chunk *c = chunk_of(k, 0);
     size_t i = (k % CHUNK) / KP;
     if (!c || !(c->backed[i / 8] >> (i % 8) & 1)) return;
-    if (c->gpu[i / 8] >> (i % 8) & 1) {   // the GPU may still read it: kept and zeroed (decommitted pages read zero)
+    if (c->gpu[i]) {   // the GPU may still read it: kept and zeroed (decommitted pages read zero) until unshared
         kprot((void *)(uintptr_t)k, KP, PROT_READ | PROT_WRITE);
         memset((void *)(uintptr_t)k, 0, KP);
         c->ww[i] &= (uint16_t)WW_ON;
@@ -572,16 +572,35 @@ void ps5_mem_gpu_share(uint64_t a, uint64_t n) {
     if (!n) return;
     plat_mutex_lock(&vm_lock);
     for (uint64_t k = a & ~(KP - 1); k < a + n && k < PS_LIMIT; k += KP) {
+        Chunk *c = chunk_of(k, 1);   // every page counted, committed or not: ps5_mem_gpu_unshare takes the same range
+        size_t i = (k % CHUNK) / KP;
+        if (c && c->gpu[i] < 255 && !c->gpu[i]++) st_add(&st_gpu_shared, 1);
         int any = 0;
-        for (uint64_t i = 0; i < SUB; i++) any |= st_get(k + i * PG) >= PS_NONE;
-        if (!any) continue;   // not committed: nothing to back (the GPU should not read it either)
-        if (!is_backed(k)) {
-            if (!back(k, kpage_prot(k))) break;   // out of memory: the import goes on, a GPU read there would fault
-            st_add(&st_gpu_backed, 1);
-        }
+        for (uint64_t j = 0; j < SUB; j++) any |= st_get(k + j * PG) >= PS_NONE;
+        if (!any || is_backed(k)) continue;   // not committed: nothing to back (the GPU should not read it either)
+        if (!back(k, kpage_prot(k))) continue;   // out of memory: the import goes on, a GPU read there would fault
+        st_add(&st_gpu_backed, 1);
+    }
+    plat_mutex_unlock(&vm_lock);
+}
+
+// The import over [a, a + n) is gone (vk_mem_back.c destroy_rec, after its vkFreeMemory; or a failed import): one
+// count less per page. A page no import covers any more and that the guest decommitted meanwhile (kept, zeroed, by
+// unback) is released now. Without this the kept pages only grew: 29,807 (466 MiB) after 25 min of racing (run 70),
+// the census's "unreadable" pages (backed, nothing committed).
+static uint64_t st_gpu_unshared, st_gpu_released;
+void ps5_mem_gpu_unshare(uint64_t a, uint64_t n) {
+    if (!n) return;
+    plat_mutex_lock(&vm_lock);
+    for (uint64_t k = a & ~(KP - 1); k < a + n && k < PS_LIMIT; k += KP) {
         Chunk *c = chunk_of(k, 0);
         size_t i = (k % CHUNK) / KP;
-        if (c && !(c->gpu[i / 8] >> (i % 8) & 1)) c->gpu[i / 8] |= (uint8_t)(1u << (i % 8)), st_add(&st_gpu_shared, 1);
+        if (!c || !c->gpu[i] || c->gpu[i] == 255) continue;   // 255: saturated, kept for the run
+        if (--c->gpu[i]) continue;
+        st_add(&st_gpu_unshared, 1);
+        int any = 0;
+        for (uint64_t j = 0; j < SUB; j++) any |= st_get(k + j * PG) >= PS_NONE;
+        if (!any && is_backed(k)) unback(k), st_add(&st_gpu_released, 1);
     }
     plat_mutex_unlock(&vm_lock);
 }
@@ -875,7 +894,7 @@ int ps5_mem_zero_census(char *out, size_t cap) {
                 if (!z) { c->zseen[i / 8] &= (uint8_t)~bit; continue; }
                 zero++;
                 if (shut) zero_shut++;
-                int gpu = c->gpu[i / 8] & bit, w = c->ww[i];
+                int gpu = c->gpu[i] != 0, w = c->ww[i];
                 if (gpu) zero_gpu++;
                 else if (w & WW_ON) zero_watched++;
                 int marks = (w & WW_ON) && (w & (WW_HOT | WW_ALL | (WW_ALL << WW_PEND_SHIFT)));
@@ -932,7 +951,7 @@ int ps5_mem_stats(char *out, size_t cap) {
                     "faults %llu (first touch %llu, write watch %llu, other %llu) %.2f s in all; backing %llu calls %.1f MiB "
                     "%.2f s (2 MiB blocks failed %llu, pages failed %llu; last %#llx states %#llx allocate %#x map %#x; hook "
                     "retried unbacked %llu; unback %llu, re-reserve failed %llu (%#x), release failed %llu (%#x)); mprotect %llu %.2f s; fault lock waits %.2f s; write-watch queries %llu, "
-                    "%.1f GiB, %.2f s; hot pages made %llu, closed again %llu; GPU pages shared %llu (backed there %llu), kept on decommit %llu",
+                    "%.1f GiB, %.2f s; hot pages made %llu, closed again %llu; GPU pages shared %llu (backed there %llu), kept on decommit %llu, unshared %llu (released then %llu)",
                     (unsigned long long)fn, (unsigned long long)st_fault_touch, (unsigned long long)st_fault_ww,
                     (unsigned long long)st_fault_other, st_fault_ns / 1e9, (unsigned long long)bn,
                     st_back_bytes / 1048576.0, st_back_ns / 1e9, (unsigned long long)st_block_fail,
@@ -941,5 +960,6 @@ int ps5_mem_stats(char *out, size_t cap) {
                     (unsigned long long)st_unback_n, (unsigned long long)st_unback_fail, (unsigned)st_unback_r,
                     (unsigned long long)st_release_fail, (unsigned)st_release_r, (unsigned long long)kn,
                     st_kprot_ns / 1e9, st_lockwait_ns / 1e9, (unsigned long long)st_ww_n, st_ww_bytes / 1073741824.0,
-                    st_ww_ns / 1e9, (unsigned long long)st_hot_made, (unsigned long long)st_hot_aged, (unsigned long long)st_gpu_shared, (unsigned long long)st_gpu_backed, (unsigned long long)st_gpu_kept);
+                    st_ww_ns / 1e9, (unsigned long long)st_hot_made, (unsigned long long)st_hot_aged, (unsigned long long)st_gpu_shared, (unsigned long long)st_gpu_backed, (unsigned long long)st_gpu_kept,
+                    (unsigned long long)st_gpu_unshared, (unsigned long long)st_gpu_released);
 }
