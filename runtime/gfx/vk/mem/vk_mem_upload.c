@@ -205,7 +205,9 @@ static void *staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc, int
         }
         plat_rmutex_unlock(&cmd_lock);
     }
-    if (stg_pool && bi.size <= STG_BLOCK / 2) aci.pool = stg_pool;
+    // Up to a whole block: a kept block that is empty holds it (the PS5 title died on a 63,194,608-byte staging buffer
+    // with both heaps at the GPU cap and the pool idle after the wait below, run 71; the same size recurs every run).
+    if (stg_pool && bi.size <= STG_BLOCK) aci.pool = stg_pool;
     VmaAllocationInfo info;
     VkBuffer b;
     VmaAllocation a;
@@ -223,7 +225,12 @@ static void *staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc, int
     // more.
     if (r != VK_SUCCESS && (retiring_count() || dead_pending() || ninflight)) {
         wait_and_collect(c);
-        r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, &info);
+        if (stg_pool && bi.size <= STG_BLOCK) {   // the batches' staging is freed now: the kept blocks first
+            VmaAllocationCreateInfo pool_aci = aci;
+            pool_aci.pool = stg_pool;
+            r = vmaCreateBuffer(c->vma, &bi, &pool_aci, &b, &a, &info);
+        }
+        if (r != VK_SUCCESS) r = vmaCreateBuffer(c->vma, &bi, &aci, &b, &a, &info);
         rt_log("vk: staging of %llu bytes after waiting for the GPU and the upload batches: %s",
                (unsigned long long)size, r == VK_SUCCESS ? "made" : "still out of memory");
     }
