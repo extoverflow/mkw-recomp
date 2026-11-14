@@ -29,6 +29,7 @@ void ps5_dump_sample(int fd, const char *name, int count, int interval_ms);
 // ps5_mem.c: faults, backing and mprotect counts and times, as one line.
 int ps5_mem_stats(char *out, size_t cap);
 int ps5_mem_brief(char *out, size_t cap);
+int ps5_mem_zero_census(char *out, size_t cap);   // ps5_mem.c: backed guest pages that read zero now
 extern int ps5_log_fd;
 extern uint64_t ps5_fs_bytes_written;   // ps5_fs.c: bytes written through the runtime's file layer
 int64_t ps5_clock_drift_ns(void);   // ps5_sync.c: the TSC clock less CLOCK_MONOTONIC   // ps5_main.c: where raw write(2) lines reach the log

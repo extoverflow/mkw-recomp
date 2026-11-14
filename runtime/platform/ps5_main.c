@@ -262,6 +262,11 @@ static void mem_watch(void *arg) {
         plat_sleep_ms(10000);
         if (ps5_heap_trim) ps5_heap_trim();
         if (tick % 3 == 0) memory_report("every 30 s");
+        if (tick % 12 == 6) {   // every 2 min: how much of the guest's backed memory reads zero (todo.md, 2-hour goal)
+            char z[320];
+            ps5_mem_zero_census(z, sizeof z);
+            fprintf(stderr, "[host] ps5: %s\n", z);
+        }
     }
 }
 
