@@ -71,6 +71,13 @@ static int nfw;
 
 uint64_t vk_exec_recording_fence(void) { return x_cur ? x_cur->fence : 0; }
 
+// The texture pins the replay state keeps across submissions (the resolved render targets), for nvn_api_cmd.c's pin
+// sweep; called on the replaying thread between submissions.
+void vk_exec_pin_refs(void (*mark)(const void *)) {
+    for (int i = 0; i < 8; i++) mark(X.color[i].tex);
+    mark(X.depth.tex);
+}
+
 void vk_exec_frame_written(const tex_t *t) {
     if (!(rt_trace & RT_TRACE_GFX) || !t) return;
     for (int i = 0; i < nfw; i++)
