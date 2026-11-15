@@ -141,7 +141,7 @@ PS5 = Target(
 PS5_WITHOUT = {"gfx/nvn/host/gfx_window_sdl.c",
                "input/input_sdl.c", "input/switch2.c", "third_party/imgui/backends/imgui_impl_sdl3.cpp",
                "third_party/imgui/backends/imgui_impl_sdlrenderer3.cpp", "ui/launcher/launcher.cpp",
-               "ui/launcher/launcher_backdrop.cpp", "ui/launcher/launcher_setup.cpp", "ui/launcher/launcher_update.cpp",
+               "ui/launcher/launcher_backdrop.cpp", "ui/launcher/launcher_lastrun.cpp", "ui/launcher/launcher_tools.cpp", "ui/launcher/launcher_setup.cpp", "ui/launcher/launcher_update.cpp",
                "ui/launcher/mods.cpp", "ui/launcher/mods_browse.cpp",  # the launcher's mod manager: launcher.cpp alone
                "ui/menu/menu_sdl.cpp"}  # fmt: skip
 WINDOWS = Target(
