@@ -49,7 +49,7 @@ static const char *const known[] = {
     "PROBE", "QUEUE_WAITS", "PROFILE", "PROFILE_CHAINS", "PROFILE_DIR", "PROFILE_FRAMES",
     "PROFILE_MAIN", "PROFILE_RENDER", "PUSH_SKIP", "PUSH_STAGE", "RDOC", "RDOC_DIR", "RDOC_DLL", "REEXEC",
     "BIND_XF", "REG_LATE", "REG_QUEUED", "REPLAY_ASYNC", "USNAP_CMP",
-    "REPLAY_CHECK", "RESOLUTION", "RESOLUTION_3D", "RESOLVE_CHECK", "ROMFS", "RTSTATS", "ROMFS_MODS", "ROMFS_PATCHES",
+    "REPLAY_CHECK", "REPLAY_PAR", "REPLAY_PAR_DRAWS", "REPLAY_PAR_FIRST", "REPLAY_PAR_THREADS", "RESOLUTION", "RESOLUTION_3D", "RESOLVE_CHECK", "ROMFS", "RTSTATS", "ROMFS_MODS", "ROMFS_PATCHES",
     "RUMBLE", "RUMBLE_CURVE", "RUMBLE_STRENGTH", "RUMBLE_TRIGGERS",
     "SHADER_MEMO", "SHADOW", "SHADOW_SIZE", "SHARED_FONTS", "SHARPNESS", "SHORTCUT_ASKED", "SHOTS", "SHOTS_DIR", "SHOTS_FULL", "SPARSE_IMAGES", "SPARSE_MIB", "SPARSE_NO_BUFFER", "SPIN", "SPIN_HANDOFF_US", "SPLIT_DRAWS", "SPLIT_US", "STEAM_X11", "STICK_DEADZONE", "SWITCH2", "SWKBD_ANSWER",
     "SKIP_PROGRAMS", "SWKBD_TEST", "TEX_ALIAS", "TEX_LARGE", "TEX_MEMO", "TEX_QUALITY", "TEX_OVERWRITTEN", "TEX_RELEASED_MIB", "TIMER_1MS", "TRACE", "TURBO", "TURBO_SPEED", "SKIP_MOVIES", "SEED", "UNLOCK_ALL", "QUICK_RACE", "FREEZE_KEYS", "QUALITY", "TRACE_UBO", "TRACE_UBO_OUT", "UBO_SNAPSHOT", "UPSCALER", "VRR", "VK_DYN_A2C", "VK_DYN_VERTEX", "VK_NO_FLOAT64",
@@ -331,6 +331,15 @@ static const struct { const char *key, *value; } PS5[] = {
     {"GPU_MEM_LIMIT", "4096"},
     // Map-sized textures (just under 8192 texels) cut to 4096 a side: at full size they did not fit the cap (run 87).
     {"TEX_LARGE", "4096"},
+    // A race frame recorded on 6 threads in chunks of 160 draws (the first 32): the game finishes submitting a frame
+    // in ~11 ms and one replay thread then needed ~15 ms of CPU, so the frame ended ~19 ms after it began (run 99,
+    // MKW_TRACE_TL). Run 103 (30 min of Grand Prix): recording ends 1.5 ms after the game's last submit, a frame every
+    // 16.8 ms, the game at 60 fps 84 % of the time against 65 % serial (run 98). Smaller chunks and 6 threads (run 104)
+    // were no better. Chunk size after ProjectReLink's RX_VK_PARALLEL_SEG (gpu/vk/vk_replay.cpp, d9f3b6d).
+    {"REPLAY_PAR", "1"},
+    {"REPLAY_PAR_DRAWS", "160"},
+    {"REPLAY_PAR_FIRST", "32"},
+    {"REPLAY_PAR_THREADS", "5"},
 };
 static int profile = -1;   // 0 none, 1 Steam Deck, 2 PS5
 
