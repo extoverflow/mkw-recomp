@@ -396,7 +396,21 @@ int plat_mem_decommit(uint64_t addr, uint64_t n) {
 int plat_mem_protect(uint64_t addr, uint64_t n, int prot) {
     plat_mutex_lock(&vm_lock);
     st_set(addr, n, (uint8_t)(PS_NONE + prot));
-    for (uint64_t k = addr & ~(KP - 1); k < addr + n; k += KP) apply(k);
+    // What apply() does page by page, one mprotect per run of backed 16 KiB pages that take the same protection (as
+    // ww_close_run): memory.c's mem_freeze makes idle 2 MiB regions read-only through here, 128 calls of ~36 us each
+    // page by page (run 94, racing: mprotect under mem_freeze 5 % of the replay thread's samples).
+    uint64_t run = 0, run_end = 0;
+    int run_prot = 0;
+    for (uint64_t k = addr & ~(KP - 1); k < addr + n; k += KP) {
+        if (!is_backed(k)) continue;   // a hole ends the run (run_end != k at the next backed page)
+        int p = kpage_prot(k);
+        if (run_end != k || p != run_prot) {
+            if (run_end > run) kprot((void *)(uintptr_t)run, run_end - run, run_prot);
+            run = k, run_prot = p;
+        }
+        run_end = k + KP;
+    }
+    if (run_end > run) kprot((void *)(uintptr_t)run, run_end - run, run_prot);
     plat_mutex_unlock(&vm_lock);
     return 1;
 }
