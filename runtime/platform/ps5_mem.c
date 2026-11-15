@@ -70,8 +70,11 @@ enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW };   // PS_NONE.. are commi
 #define WW_HOT (1u << (2 * SUB + 1))  // ww[]: bit 9, the page is hot (open, always reported written)
 #define WW_SC_SHIFT (2 * SUB + 2)     // ww[]: bits 10-15, resets in a row that found it written; when hot, its age
 #define WW_SC_MASK (63u << WW_SC_SHIFT)
-#define WW_HOT_AFTER 3
-#define WW_HOT_AGE 32
+// Defaults; MKW_PS5_WW_HOT_AFTER / MKW_PS5_WW_HOT_AGE (args.txt) change them (ww_hot_wanted). 2 and 63 against the
+// first 3 and 32 (runs 96 and 98, 30 min of Grand Prix each): write-watch faults per 30 s of racing 30k against 53k,
+// mprotects 54k against 87k, the game at 60 fps 65 % of the time against 63 %.
+#define WW_HOT_AFTER 2
+#define WW_HOT_AGE 63    // at most 63: the age is kept in the score's 6 bits
 
 typedef struct {
     uint8_t state[CHUNK / PG];       // per 4 KiB page
@@ -133,10 +136,16 @@ static int ww_score(uint16_t w) { return (int)(w >> WW_SC_SHIFT & 63); }
 static uint16_t ww_with_score(uint16_t w, int sc) {
     return (uint16_t)((w & ~WW_SC_MASK) | ((unsigned)(sc > 63 ? 63 : sc) << WW_SC_SHIFT));
 }
+static int hot_after = WW_HOT_AFTER, hot_age = WW_HOT_AGE;
 static int ww_hot_wanted(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("MKW_PS5_WW_HOT");
+        // A measurement (2026-11-15): with the defaults, as many pages aged out as were made hot (run 96: ~2,400 each
+        // per 30 s of racing), and each one closed faults again at the game's next write.
+        const char *a = getenv("MKW_PS5_WW_HOT_AFTER"), *g = getenv("MKW_PS5_WW_HOT_AGE");
+        if (a && atoi(a) >= 1 && atoi(a) <= 63) hot_after = atoi(a);
+        if (g && atoi(g) >= 2 && atoi(g) <= 63) hot_age = atoi(g);
         on = e && !strcmp(e, "1");
     }
     return on;
@@ -498,8 +507,8 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
             }
             if (!reset) continue;
             int age = ww_score(*w) + 1;
-            if (age < WW_HOT_AGE || !rep) {
-                *w = ww_with_score(*w, age < WW_HOT_AGE ? age : WW_HOT_AGE - 1);
+            if (age < hot_age || !rep) {
+                *w = ww_with_score(*w, age < hot_age ? age : hot_age - 1);
                 continue;
             }
             // Closed again to see whether the game still writes it (a write since faults and marks it as usual), as
@@ -532,7 +541,7 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
         }
         if (!reset || !cleared) continue;
         int sc = ww_score(*w) + 1;
-        if (hot_on && sc >= WW_HOT_AFTER && (*w & WW_ALL) == WW_ALL && is_backed(k) && (kpage_prot(k) & PROT_WRITE)) {
+        if (hot_on && sc >= hot_after && (*w & WW_ALL) == WW_ALL && is_backed(k) && (kpage_prot(k) & PROT_WRITE)) {
             *w = (uint16_t)((*w & ~WW_SC_MASK) | WW_HOT);   // open already (wholly marked): stays so, age 0
             st_add(&st_hot_made, 1);
             continue;
