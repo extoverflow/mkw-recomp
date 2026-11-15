@@ -58,15 +58,17 @@ enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW };   // PS_NONE.. are commi
 #define WW_ALL ((1u << SUB) - 1)     // ww[]: bits 0-3, one per 4 KiB page written since its last reset
 #define WW_PEND_SHIFT SUB            // ww[]: bits 4-7, reported and to unmark once the page is closed (a reset)
 #define WW_ON (1u << (2 * SUB))      // ww[]: the 16 KiB page lies in a watched reservation
-// Hot pages (MKW_PS5_WW_HOT=1; off by default since two silent crashes, below): a page reported written by WW_HOT_AFTER resets in a row (the game rewrites
+// Hot pages (on by default; MKW_PS5_WW_HOT=0 turns them off): a page reported written by WW_HOT_AFTER resets in a row (the game rewrites
 // its per-frame buffers every frame) stays open and is reported written by every query instead of being closed and
 // faulting again: each such cycle cost a signal, the lock and two mprotects (race, run 42: 1.18 M write-watch faults,
 // 117 us each with the lock waits; mprotect 36 us). A report may hold more pages than were written, never fewer. Every
 // WW_HOT_AGE resets a hot page is closed again, so pages the game stopped writing go back to being watched.
-// Off by default: a report is a generation stamp ("the CPU wrote here"), and the shadows copy stamped pages into the
-// GPU's copy at each submit and write the GPU's results back; a hot page stamped at every query can let an older guest
-// copy overwrite fresh GPU output (runs 45 and 48 ended with the console's "Game or App Error" CE-108255-1 near a race
-// start, no FATAL; none in five race runs without hot pages). Needs pages the GPU writes kept out before it is on.
+// History: off by default from 2026-11-13 (runs 45 and 48 ended with the console's "Game or App Error" CE-108255-1
+// near a race start, no FATAL; the GPU page faults fixed afterwards were the likelier cause) and because a report is a
+// generation stamp the shadows act on (the PS5 profile now runs without shadows, MKW_SHADOW=0). Run 91 (2026-11-14) had
+// the flicker, geometry spikes and the course map without its colours: the aging lost writes, fixed in
+// plat_mem_written. On by default since 2026-11-15 after runs 93-109: two 2-hour soaks without a
+// crash, write-watch faults about a third, the game at 60 fps 87 % of the time (run 109).
 #define WW_HOT (1u << (2 * SUB + 1))  // ww[]: bit 9, the page is hot (open, always reported written)
 #define WW_SC_SHIFT (2 * SUB + 2)     // ww[]: bits 10-15, resets in a row that found it written; when hot, its age
 #define WW_SC_MASK (63u << WW_SC_SHIFT)
@@ -146,7 +148,9 @@ static int ww_hot_wanted(void) {
         const char *a = getenv("MKW_PS5_WW_HOT_AFTER"), *g = getenv("MKW_PS5_WW_HOT_AGE");
         if (a && atoi(a) >= 1 && atoi(a) <= 63) hot_after = atoi(a);
         if (g && atoi(g) >= 2 && atoi(g) <= 63) hot_age = atoi(g);
-        on = e && !strcmp(e, "1");
+        on = !(e && !strcmp(e, "0"));
+        fprintf(stderr, "[host] ps5: hot pages %s (MKW_PS5_WW_HOT), made hot after %d written queries, closed again after %d\n",
+                on ? "on" : "off", hot_after, hot_age);
     }
     return on;
 }
