@@ -544,6 +544,12 @@ def main() -> None:
                            ("LLVM_CONFIG", Path(os.environ.get("LLVM_CONFIG", "/nonexistent")))):  # fmt: skip
             if not path.exists():
                 sys.exit(f"--target ps5: {name} must point to it ({path} is missing; tools/build/README.md)")
+        # The game code at -O2 on the PS5 unless MKW_GEN_OPT says otherwise: there its CPU time is the frame critical
+        # path in crowded race frames. Runs 114/115 (20 min of Grand Prix each, timeline): the game last submit at the
+        # 90th percentile 12.3 ms against 15.2 at -O1, a frame every 20.4 ms against 22.6, 86 % of the time at 60 fps
+        # against 84 %; the build takes ~4 min either way.
+        if "MKW_GEN_OPT" not in os.environ:
+            GEN_FLAGS[0] = "-O2"
     if args.arch != "x86_64" and target is WINDOWS:
         ap.error("--target windows is x86_64 only")
     if args.cpu == "noavx2" and args.arch != "x86_64":
