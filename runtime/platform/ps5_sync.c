@@ -46,6 +46,15 @@ uint64_t plat_now_ns(void) {
     uint64_t d = __builtin_ia32_rdtsc() - tsc0;
     return ns0 + (uint64_t)(((unsigned __int128)d * m) >> 32);
 }
+// Mesa's clock (PS5_Mesa 0f86253 src/util/os_time.c: os_time_get_nano -> timespec_get -> clock_gettime, a system call
+// here) from the same TSC: RADV's PS5 winsys reads it several times per submission for its statistics
+// (src/amd/vulkan/winsys/ps5/radv_ps5_cs.c:627-663, radv_ps5_platform.c:802-835; run 93, racing: 4.2 % of the replay
+// thread's samples, all under radv_ps5_submit). The title is linked with --wrap=os_time_get_nano
+// (the port's link script), so RADV's calls come here; os_time.c's own calls (its
+// absolute timeouts) keep the kernel's clock, which this one follows within a few microseconds (ps5_clock_drift_ns).
+int64_t __wrap_os_time_get_nano(void);
+int64_t __wrap_os_time_get_nano(void) { return (int64_t)plat_now_ns(); }
+
 // The TSC clock less the kernel's, now (positive: ahead); for the memory line.
 int64_t ps5_clock_drift_ns(void) { return (int64_t)(plat_now_ns() - kernel_now_ns()); }
 
