@@ -11,6 +11,7 @@
 
 #include <SDL3/SDL.h>
 
+#include "gfx/nvn/host/gfx_wsys.h"
 #include "host.h"
 #include "platform/platform.h"
 
@@ -452,4 +453,17 @@ void SDL_DestroyAudioStream(SDL_AudioStream *s) {
     plat_thread_join(s->thread);
     sceAudioOutClose(s->port);
     free(s);
+}
+
+// ---- display: the console's one display at the size the PS5 window reports, 60 Hz (VideoOut's mode on this console)
+SDL_DisplayID SDL_GetPrimaryDisplay(void) { return 1; }
+
+const SDL_DisplayMode *SDL_GetCurrentDisplayMode(SDL_DisplayID displayID) {
+    static SDL_DisplayMode m;
+    if (displayID != 1) return NULL;
+    int w = 0, h = 0;
+    wsys_client_size(&w, &h);
+    m = (SDL_DisplayMode){.displayID = 1, .w = w, .h = h, .pixel_density = 1.0f, .refresh_rate = 60.0f,
+                          .refresh_rate_numerator = 60, .refresh_rate_denominator = 1};
+    return &m;
 }

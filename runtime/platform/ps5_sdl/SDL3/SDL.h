@@ -124,6 +124,22 @@ SDL_AudioDeviceID SDL_GetAudioStreamDevice(SDL_AudioStream *stream);
 const char *SDL_GetAudioDeviceName(SDL_AudioDeviceID devid);
 void SDL_DestroyAudioStream(SDL_AudioStream *stream);
 
+// ---- SDL_video.h (display modes): ui/menu/settings_tabs.cpp asks the primary display's height when the game window
+// gives none (upstream 7594caa); the console's one display, the size the PS5 window has (platform/ps5_window.c).
+typedef Uint32 SDL_DisplayID;
+typedef Uint32 SDL_PixelFormat;
+typedef struct SDL_DisplayModeData SDL_DisplayModeData;
+typedef struct SDL_DisplayMode {
+    SDL_DisplayID displayID;
+    SDL_PixelFormat format;
+    int w, h;
+    float pixel_density, refresh_rate;
+    int refresh_rate_numerator, refresh_rate_denominator;
+    SDL_DisplayModeData *internal;
+} SDL_DisplayMode;
+SDL_DisplayID SDL_GetPrimaryDisplay(void);
+const SDL_DisplayMode *SDL_GetCurrentDisplayMode(SDL_DisplayID displayID);
+
 #ifdef __cplusplus
 }
 #endif
