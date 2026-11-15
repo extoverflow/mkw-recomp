@@ -326,6 +326,9 @@ static const CfgRow rows[] = {
     K("REG_QUEUED"),
     K("REPLAY_CHECK"),
     K("REPLAY_PAR"),
+    K("REPLAY_PAR_DRAWS"),
+    K("REPLAY_PAR_FIRST"),
+    K("REPLAY_PAR_THREADS"),
     K("RESOLVE_CHECK"),
     K("ROMFS"),
     K("ROMFS_MODS"),
@@ -552,6 +555,15 @@ static const struct { const char *key, *value; } PS5[] = {
     {"GPU_MEM_LIMIT", "4096"},
     // Map-sized textures (just under 8192 texels) cut to 4096 a side: at full size they did not fit the cap (run 87).
     {"TEX_LARGE", "4096"},
+    // A race frame recorded on 6 threads in chunks of 160 draws (the first 32): the game finishes submitting a frame
+    // in ~11 ms and one replay thread then needed ~15 ms of CPU, so the frame ended ~19 ms after it began (run 99,
+    // MKW_TRACE_TL). Run 103 (30 min of Grand Prix): recording ends 1.5 ms after the game's last submit, a frame every
+    // 16.8 ms, the game at 60 fps 84 % of the time against 65 % serial (run 98). Smaller chunks and 6 threads (run 104)
+    // were no better. Chunk size after ProjectReLink's RX_VK_PARALLEL_SEG (gpu/vk/vk_replay.cpp, d9f3b6d).
+    {"REPLAY_PAR", "1"},
+    {"REPLAY_PAR_DRAWS", "160"},
+    {"REPLAY_PAR_FIRST", "32"},
+    {"REPLAY_PAR_THREADS", "5"},
 };
 static int profile = -1;   // 0 none, 1 Steam Deck, 2 PS5
 
