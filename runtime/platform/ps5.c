@@ -678,3 +678,116 @@ void plat_thread_set_priority(PlatThread *t, int prio) { t->prio = prio; }
 int plat_thread_priority_get(void) { return my_prio; }
 
 void plat_yield(void) { sched_yield(); }
+
+// ---- GPU memory log (MKW_PS5_GPUMEM_LOG=IP:PORT; a diagnosis, off by default). The silent exits (CE-108255-1) are GPU page
+// faults at host addresses past the guest's (run 129b: "GPU Protection fault ... client:TCP(8) access:Read, reason:
+// Unmapped page access, addr(VA): 0x40d280c000", GPU_FAULT_PAGE_FAULT_ASYNC; PS_LIMIT is 0x4000000000): memory RADV
+// gave back while queued GPU work still read it. RADV's PS5 winsys maps and frees its memory through
+// radv_ps5_platform.c (PS5_Mesa 0f86253 src/amd/vulkan/winsys/ps5/radv_ps5_platform.c:292 radv_ps5_memory_alloc,
+// :433 radv_ps5_memory_alloc_replayable, :730 radv_ps5_vrange_release, :746 radv_ps5_memory_free, :910
+// radv_ps5_memory_unmap_at; struct radv_ps5_memory radv_ps5_platform.h:48-60 begins with the mapping, which is also
+// the GPU address, and its size). The title is linked with --wrap for each (the port's link script); here each
+// call is sent to the listener as it happens (gm_line): the wall clock (UTC, as the
+// kernel log recorder stamps its lines), the kind (A alloc, F free, V vrange release, U unmap), address, size, and the
+// first return addresses on the stack inside the title (offsets from __ehdr_start, for llvm-symbolizer); sparse binds below.
+#include <stdbool.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+struct radv_ps5_memory;
+typedef struct { uint8_t *cpu; uint64_t bytes; } GmHead;   // radv_ps5_platform.h:48-51
+bool __real_radv_ps5_memory_alloc(uint64_t bytes, uint64_t alignment, bool window32, struct radv_ps5_memory *out);
+bool __real_radv_ps5_memory_alloc_replayable(uint64_t bytes, uint64_t alignment, bool window32, uint64_t replay_va,
+                                             struct radv_ps5_memory *out);
+void __real_radv_ps5_memory_free(struct radv_ps5_memory *memory);
+void __real_radv_ps5_vrange_release(struct radv_ps5_memory *range);
+void __real_radv_ps5_memory_unmap_at(void *address, uint64_t bytes, bool reserve);
+bool __wrap_radv_ps5_memory_alloc(uint64_t bytes, uint64_t alignment, bool window32, struct radv_ps5_memory *out);
+bool __wrap_radv_ps5_memory_alloc_replayable(uint64_t bytes, uint64_t alignment, bool window32, uint64_t replay_va,
+                                             struct radv_ps5_memory *out);
+void __wrap_radv_ps5_memory_free(struct radv_ps5_memory *memory);
+void __wrap_radv_ps5_vrange_release(struct radv_ps5_memory *range);
+void __wrap_radv_ps5_memory_unmap_at(void *address, uint64_t bytes, bool reserve);
+
+static int gm_fd = -2;   // -2 not decided, -1 off: a UDP socket to GM_TO
+static struct sockaddr_in gm_to;
+static uint64_t gm_n;
+
+// MKW_PS5_GPUMEM_LOG=IP:PORT: one UDP datagram a line to a listener (a UDP listener on the LAN). Not a file:
+// a write(2) to /data a call stalled the title (run 130: 0.1x speed, allocations ~950 ms each; cf. Step 4 run 12's
+// unbuffered stdio on /data), and a datagram already sent survives the fault that ends the title. The frees of empty
+// memory (address 0: the winsys's per-submission dedicated slot, radv_ps5_cs.c:395) are not sent.
+static __attribute__((noinline)) void gm_line(char kind, uint64_t va, uint64_t bytes) {
+    if (!va) return;
+    if (gm_fd == -2) {
+        const char *e = getenv("MKW_PS5_GPUMEM_LOG");
+        int fd = -1;
+        char ip[32] = "";
+        int port = 0;
+        if (e && sscanf(e, "%31[0-9.]:%d", ip, &port) == 2 && port > 0) {
+            memset(&gm_to, 0, sizeof gm_to);
+            gm_to.sin_family = AF_INET;
+            gm_to.sin_port = htons((uint16_t)port);
+            if (inet_pton(AF_INET, ip, &gm_to.sin_addr) == 1) fd = socket(AF_INET, SOCK_DGRAM, 0);
+        }
+        int was = -2;
+        if (!__atomic_compare_exchange_n(&gm_fd, &was, fd, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) && fd >= 0) close(fd);
+        else if (fd >= 0) fprintf(stderr, "[host] ps5: RADV's memory allocations and frees go to %s by UDP (MKW_PS5_GPUMEM_LOG)\n", e);
+    }
+    int fd = __atomic_load_n(&gm_fd, __ATOMIC_ACQUIRE);
+    if (fd < 0) return;
+    if (!text_hi) text_range();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    gmtime_r(&ts.tv_sec, &tm);
+    char b[256];
+    int k = snprintf(b, sizeof b, "%02d:%02d:%02d.%03ld %c %#llx %#llx %llu", tm.tm_hour, tm.tm_min, tm.tm_sec,
+                     ts.tv_nsec / 1000000, kind, (unsigned long long)va, (unsigned long long)bytes,
+                     (unsigned long long)__atomic_add_fetch(&gm_n, 1, __ATOMIC_RELAXED));
+    const uint64_t *sp = (const uint64_t *)__builtin_frame_address(0);
+    for (int i = 0, got = 0; i < 160 && got < 6 && k < (int)sizeof b - 24; i++) {   // this thread's own stack
+        uint64_t v = sp[i];
+        if (v >= text_lo && v < text_hi) k += snprintf(b + k, sizeof b - (size_t)k, " %#llx", (unsigned long long)(v - text_lo)), got++;
+    }
+    (void)!sendto(fd, b, (size_t)k, 0, (const struct sockaddr *)&gm_to, sizeof gm_to);
+}
+
+bool __wrap_radv_ps5_memory_alloc(uint64_t bytes, uint64_t alignment, bool window32, struct radv_ps5_memory *out) {
+    bool ok = __real_radv_ps5_memory_alloc(bytes, alignment, window32, out);
+    if (ok) gm_line('A', (uint64_t)(uintptr_t)((GmHead *)out)->cpu, ((GmHead *)out)->bytes);
+    return ok;
+}
+bool __wrap_radv_ps5_memory_alloc_replayable(uint64_t bytes, uint64_t alignment, bool window32, uint64_t replay_va,
+                                             struct radv_ps5_memory *out) {
+    bool ok = __real_radv_ps5_memory_alloc_replayable(bytes, alignment, window32, replay_va, out);
+    if (ok) gm_line('A', (uint64_t)(uintptr_t)((GmHead *)out)->cpu, ((GmHead *)out)->bytes);
+    return ok;
+}
+void __wrap_radv_ps5_memory_free(struct radv_ps5_memory *memory) {
+    gm_line('F', (uint64_t)(uintptr_t)((GmHead *)memory)->cpu, ((GmHead *)memory)->bytes);
+    __real_radv_ps5_memory_free(memory);
+}
+void __wrap_radv_ps5_vrange_release(struct radv_ps5_memory *range) {
+    gm_line('V', (uint64_t)(uintptr_t)((GmHead *)range)->cpu, ((GmHead *)range)->bytes);
+    __real_radv_ps5_vrange_release(range);
+}
+void __wrap_radv_ps5_memory_unmap_at(void *address, uint64_t bytes, bool reserve) {
+    gm_line('U', (uint64_t)(uintptr_t)address, bytes);
+    __real_radv_ps5_memory_unmap_at(address, bytes, reserve);
+}
+// Sparse ranges: binding and unbinding pages of a reserved range (radv_ps5_platform.c:633 radv_ps5_vrange_unbind, :648
+// radv_ps5_vrange_bind): an unbind maps nothing there again, as a free does. B bind, X unbind.
+bool __real_radv_ps5_vrange_bind(void *at, uint64_t bytes, const struct radv_ps5_memory *memory, uint64_t offset);
+bool __real_radv_ps5_vrange_unbind(void *at, uint64_t bytes);
+bool __wrap_radv_ps5_vrange_bind(void *at, uint64_t bytes, const struct radv_ps5_memory *memory, uint64_t offset);
+bool __wrap_radv_ps5_vrange_unbind(void *at, uint64_t bytes);
+bool __wrap_radv_ps5_vrange_bind(void *at, uint64_t bytes, const struct radv_ps5_memory *memory, uint64_t offset) {
+    bool ok = __real_radv_ps5_vrange_bind(at, bytes, memory, offset);
+    gm_line(ok ? 'B' : 'b', (uint64_t)(uintptr_t)at, bytes);
+    return ok;
+}
+bool __wrap_radv_ps5_vrange_unbind(void *at, uint64_t bytes) {
+    gm_line('X', (uint64_t)(uintptr_t)at, bytes);
+    return __real_radv_ps5_vrange_unbind(at, bytes);
+}
