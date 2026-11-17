@@ -408,11 +408,33 @@ uint64_t vk_mem_defer_fence(uint64_t fence) {
     return prev;
 }
 
+// MKW_DEFER_OUTSIDE (PS5 port; default 1): an image or view destroyed outside a recording (no submission given, not idle,
+// rec_fence 0: the game's thread, vk_pool_fini -> vk_texture_range_gone) waits for the newest submission handed out
+// (vk_sync_named_last), not for the parts sent alone. With MKW_SUBMIT_CATCHUP=0 the replay records behind the game: the
+// parts being recorded and queued may name images of the pool the game finalizes. Run 133's log (MKW_PS5_GPUMEM_LOG):
+// all 213 frees with no wait of their own came from nvnMemoryPoolFinalize -> vk_be_pool_fini -> vk_pool_fini ->
+// vk_texture_range_gone -> destroy_tex, each pool's images together; run 131's GPU page fault was at an image freed in
+// such a burst. =0: upstream's rule (the parts sent).
+static int defer_outside(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("MKW_DEFER_OUTSIDE");
+        on = !(e && !strcmp(e, "0"));
+        if (!on) rt_log("vk: objects destroyed outside a recording wait for the parts sent only (MKW_DEFER_OUTSIDE=0)");
+    }
+    return on;
+}
+
 static void defer(int kind, uint64_t handle, VmaAllocation alloc) {
     plat_once(&cmd_once, cmd_init, NULL);
+    // Before the upload lock: vk_sync_named_last takes the sync state lock.
+    // Images and views only: a buffer destroyed outside a recording is a completion callback's (mirror_retire, after its
+    // value is done) or an upload's, and holding those longer left the host heap full while loading (rt-b0, vk_memory.c).
+    int img = kind == DEAD_IMAGE || kind == DEAD_IMAGE_VMA || kind == DEAD_VIEW;
+    uint64_t outside = img && !defer_fence && !idle_defer && !rec_fence && defer_outside() ? vk_sync_named_last() : 0;
     plat_rmutex_lock(&cmd_lock);
     // MKW_GPU_GUARD: tied to the submission being recorded, every part of it is covered; otherwise only the parts sent.
-    uint64_t fence = defer_fence ? defer_fence : idle_defer ? 0 : rec_fence;
+    uint64_t fence = defer_fence ? defer_fence : idle_defer ? 0 : rec_fence ? rec_fence : outside;
     if (defer_use && !fence)
         vk_guard_tie(kind == DEAD_VIEW ? "image view" : kind == DEAD_BUFFER_VMA ? "buffer" : "image", handle, 0,
                      defer_use, tl_noted);

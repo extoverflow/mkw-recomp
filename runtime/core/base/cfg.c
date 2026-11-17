@@ -234,6 +234,7 @@ static const CfgRow rows[] = {
     K("CRIT"),
     K("CRIT_OUT"),
     K("CTL"),
+    K("DEFER_OUTSIDE"),
     K("DISCORD_APP"),
     K("DLSSG_DISABLE_BUF"),
     K("DLSSG_EXP"),
