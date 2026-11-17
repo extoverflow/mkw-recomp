@@ -454,6 +454,19 @@ int plat_cpu_cores(uint64_t *all, uint64_t *first) {
     return cores;
 }
 
+// linux.c:130 matches a processor's core by /sys core_id; here by plat_cpu_cores' rule (2k and 2k+1 share a core).
+uint64_t plat_cpu_core_of(int cpu) {
+    if (cpu < 0 || cpu > 63) return 0;
+    return 3ull << (cpu & ~1);
+}
+
+// linux.c:141 picks the processors with the highest cpufreq maximum (a hybrid CPU's performance cores). The PS5's eight
+// Zen 2 cores are alike: every processor the process may use; 0 when the cpuset cannot be read.
+uint64_t plat_cpu_fast(void) {
+    uint64_t m = 0;
+    return cpuset_mask(&m) ? m : 0;
+}
+
 int plat_process_affinity(uint64_t mask) {
     cpuset_t set;
     CPU_ZERO(&set);
