@@ -516,7 +516,13 @@ NVN_API(nvnMultisampleStateSetDefaults) {
 }
 NVN_API(nvnMultisampleStateSetMultisampleEnable) { ST(ms_st, c)->enable = nvn_arg_bool(c, 1) != 0; }
 NVN_API(nvnMultisampleStateSetSamples) { ST(ms_st, c)->samples = (uint8_t)arg_x(c, 1); }
-NVN_API(nvnMultisampleStateSetAlphaToCoverageEnable) { ST(ms_st, c)->a2c = nvn_arg_bool(c, 1) != 0; }
+void nvn_a2c_note(const char *what, int on, uint64_t *n);   // nvn_ext.c
+static uint64_t a2c_enable_calls[2];
+NVN_API(nvnMultisampleStateSetAlphaToCoverageEnable) {
+    int on = nvn_arg_bool(c, 1) != 0;
+    ST(ms_st, c)->a2c = (uint8_t)on;
+    nvn_a2c_note("nvnMultisampleStateSetAlphaToCoverageEnable", on, &a2c_enable_calls[on]);
+}
 NVN_API(nvnMultisampleStateSetSampleLocationsEnable) { ST(ms_st, c)->sl_en = nvn_arg_bool(c, 1) != 0; }
 // void nvnMultisampleStateSetSampleLocations(NVNmultisampleState *s, int start, int n, const float *v): programmable
 // sample positions are not replayed
