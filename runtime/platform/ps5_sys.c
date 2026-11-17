@@ -209,6 +209,25 @@ int plat_random(void *out, size_t n) {
     return 1;
 }
 
+// ---- local IPC (Discord's Rich Presence, linux_sys.c:306-353 on a Unix socket): no Discord runs on the console, so
+// nobody listens: plat_ipc_open answers NULL, as on a desktop without Discord, and core/presence never sends.
+PlatIpc *plat_ipc_open(const char *name) {
+    (void)name;
+    return NULL;
+}
+
+int plat_ipc_send(PlatIpc *c, const void *data, size_t n) {
+    (void)c, (void)data, (void)n;
+    return 0;
+}
+
+long plat_ipc_recv(PlatIpc *c, void *buf, size_t cap) {
+    (void)c, (void)buf, (void)cap;
+    return -1;
+}
+
+void plat_ipc_close(PlatIpc *c) { (void)c; }
+
 // ---- desktop: none on the console
 int plat_clipboard_set(const char *utf8) {
     (void)utf8;
