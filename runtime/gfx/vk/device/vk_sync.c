@@ -769,6 +769,17 @@ uint64_t vk_sync_fence_queued(void) { return __atomic_load_n(&queued, __ATOMIC_A
 
 uint64_t vk_sync_issued(void) { return __atomic_load_n(&issued, __ATOMIC_ACQUIRE); }
 
+// The newest value a submission handed out (queued for the asynchronous replay, vk_sync_reserve) or being recorded
+// (cur_fence, issued once its last part is submitted) will signal: what an object destroyed outside a recording may still
+// be named by (vk_mem_upload.c defer).
+uint64_t vk_sync_named_last(void) {
+    plat_mutex_lock(&st_lock);
+    uint64_t v = reserved > issued ? reserved : issued;
+    plat_mutex_unlock(&st_lock);
+    uint64_t cur = __atomic_load_n(&cur_fence, __ATOMIC_ACQUIRE);
+    return cur > v ? cur : v;
+}
+
 // MKW_FENCE_EARLY: value is recorded and its last part handed to the queue (issued moves under st_lock and broadcasts
 // cv_work). A value the replay will never record (beyond what was handed out) is never reached.
 int vk_sync_issued_wait(uint64_t value, uint64_t timeout_ns) {

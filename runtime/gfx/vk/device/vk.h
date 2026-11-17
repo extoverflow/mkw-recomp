@@ -566,6 +566,7 @@ void vk_tl_wait(uint64_t f, int64_t t0, int64_t t1);     // a blocking wait for 
 void vk_tl_present(uint64_t f, uint64_t frame);          // the replay thread presents value f
 enum { VK_TL_IDLE, VK_TL_SUBMIT, VK_TL_PRESENT, VK_TL_RELEASE, VK_TL_REG, VK_TL_KINDS };
 void vk_tl_replay_time(int kind, int64_t ns);             // the replay thread's time waiting for items or on one kind
+uint64_t vk_sync_named_last(void);         // newest value a queued or recording submission will signal
 uint64_t vk_sync_issued(void);             // newest submitted value (the one being recorded is this + 1)
 int vk_sync_issued_wait(uint64_t value, uint64_t timeout_ns);   // 1 once value is recorded and handed to the queue
 // Parts: every queue submission of vk_sync_submit and vk_sync_split also signals the next part value, so what is
