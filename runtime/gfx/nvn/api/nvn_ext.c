@@ -346,7 +346,19 @@ NVN_API(nvnMultisampleStateSetRasterSamples) {
     ST(ms_st)->raster_samples = (uint8_t)n;
 }
 // void nvnMultisampleStateSetAlphaToCoverageDither(NVNmultisampleState *s, NVNboolean enable)
-NVN_API(nvnMultisampleStateSetAlphaToCoverageDither) { ST(ms_st)->a2c_dither = nvn_arg_bool(c, 1) != 0; }
+// MKW_PS5 diagnosis (2026-11-16, a crosshatch seen over a race intro): what the game asks of alpha to
+// coverage. RADV dithers it over 2x2 pixels unless RADV_DEBUG=noatocdithering (PS5_Mesa 0f86253
+// src/amd/vulkan/radv_cmd_buffer.c:13290-13297); the dither flag is recorded here but no Vulkan state carries it.
+static uint64_t a2c_dither_calls[2];
+void nvn_a2c_note(const char *what, int on, uint64_t *n) {
+    uint64_t k = __atomic_add_fetch(n, 1, __ATOMIC_RELAXED);
+    if (!(k & (k - 1))) rt_log("nvn: %s %d (call %llu)", what, on, (unsigned long long)k);
+}
+NVN_API(nvnMultisampleStateSetAlphaToCoverageDither) {
+    int on = nvn_arg_bool(c, 1) != 0;
+    ST(ms_st)->a2c_dither = (uint8_t)on;
+    nvn_a2c_note("nvnMultisampleStateSetAlphaToCoverageDither", on, &a2c_dither_calls[on]);
+}
 NVN_API(nvnPolygonStateGetCullFace) { ret_x(c, ST(poly_st)->cull); }
 NVN_API(nvnPolygonStateGetFrontFace) { ret_x(c, ST(poly_st)->front); }
 NVN_API(nvnPolygonStateGetPolygonMode) { ret_x(c, ST(poly_st)->mode); }
