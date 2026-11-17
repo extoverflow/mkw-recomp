@@ -30,7 +30,20 @@ typedef struct {
 enum { DEAD_IMAGE = 1, DEAD_IMAGE_VMA, DEAD_VIEW, DEAD_BUFFER_VMA, DEAD_CALL };
 // seq: the upload batch, tl: the submission part (vk_sync_part_done) and fence: the submission (timeline value) that may
 // still use it; vma: NULL = the runtime's; use: MKW_GPU_GUARD, the newest part that named it (vk_mem_defer_use)
-typedef struct { int kind; uint64_t handle; VmaAllocation alloc; uint64_t seq, tl, fence; VmaAllocator vma; uint64_t use; } Dead;
+// why: MKW_PS5_GPUMEM_LOG only (runtime/platform/ps5.c): what the free waited for and where defer() was called from.
+typedef struct { int kind; uint64_t handle; VmaAllocation alloc; uint64_t seq, tl, fence; VmaAllocator vma; uint64_t use;
+                 uint64_t why[10]; } Dead;
+
+// MKW_PS5_GPUMEM_LOG: the GPU page faults at freed driver memory (run 131: the faulting address freed in a burst of ~30
+// dedicated image frees, the free's own stack ending inside VMA) are matched to the defer() that queued the object.
+// why[0]: kind | path << 8 (1 a submission given (vk_mem_defer_fence), 2 idle (vk_mem_defer_idle: the parts sent), 3
+// the submission being recorded, 0 none); [1] the parts noted submitted then (tl_noted); [2..9] return addresses on
+// the deferring thread's stack. ps5.c adds them, and the done values when it went, to the free's line. Weak: the
+// Linux build has none of them.
+int ps5_gm_on(void) __attribute__((weak));
+int ps5_gm_stack(uint64_t *w, int n) __attribute__((weak));
+void ps5_gm_dying(const uint64_t *why, uint64_t seq, uint64_t tl, uint64_t fence, uint64_t done_seq, uint64_t tl_done,
+                  uint64_t fdone) __attribute__((weak));
 
 static PlatRMutex cmd_lock;
 static int depth;                     // vk_upload_begin calls not yet ended: a flush inside one would end its cb
@@ -93,6 +106,7 @@ static void collect_locked(VkCtx *c) {
         if (d->use && d->kind != DEAD_CALL)
             vk_guard_dead(d->kind == DEAD_VIEW ? "image view" : d->kind == DEAD_BUFFER_VMA ? "buffer" : "image",
                           d->handle, 0, d->use);
+        if (d->why[0] && ps5_gm_dying) ps5_gm_dying(d->why, d->seq, d->tl, d->fence, done_seq, tl, fdone);
         switch (d->kind) {
         case DEAD_IMAGE: vkDestroyImage(c->device, (VkImage)(uintptr_t)d->handle, NULL); break;
         case DEAD_IMAGE_VMA: vmaDestroyImage(c->vma, (VkImage)(uintptr_t)d->handle, d->alloc); break;
@@ -100,6 +114,7 @@ static void collect_locked(VkCtx *c) {
         case DEAD_BUFFER_VMA: vmaDestroyBuffer(d->vma ? d->vma : c->vma, (VkBuffer)(uintptr_t)d->handle, d->alloc); break;
         case DEAD_CALL: ((void (*)(void *))(uintptr_t)d->handle)((void *)d->alloc); break;
         }
+        if (d->why[0] && ps5_gm_dying) ps5_gm_dying(NULL, 0, 0, 0, 0, 0, 0);
     }
     ndead = k;
 }
@@ -441,7 +456,13 @@ static void defer(int kind, uint64_t handle, VmaAllocation alloc) {
     if (ndead == cap_dead) vk_mem_grow((void **)&dead, &cap_dead, sizeof *dead);
     // The open batch may record into the object: it counts as the newest user.
     dead[ndead++] = (Dead){kind, handle, alloc, open_active ? open_b.seq : next_seq, tl_noted,
-                           fence, defer_vma, defer_use};
+                           fence, defer_vma, defer_use, {0}};
+    if (ps5_gm_on && ps5_gm_on()) {
+        Dead *d = &dead[ndead - 1];
+        d->why[0] = (uint64_t)kind | (uint64_t)(defer_fence ? 1 : idle_defer ? 2 : rec_fence ? 3 : outside ? 4 : 0) << 8;
+        d->why[1] = tl_noted;
+        ps5_gm_stack(d->why + 2, 8);
+    }
     plat_rmutex_unlock(&cmd_lock);
 }
 
