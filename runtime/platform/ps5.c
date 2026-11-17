@@ -725,13 +725,14 @@ void __wrap_radv_ps5_memory_unmap_at(void *address, uint64_t bytes, bool reserve
 static int gm_fd = -2;   // -2 not decided, -1 off: a UDP socket to GM_TO
 static struct sockaddr_in gm_to;
 static uint64_t gm_n;
+static _Thread_local const uint64_t *gm_why;   // ps5_gm_dying: the object vk_mem_upload.c's collect_locked destroys now
+static _Thread_local uint64_t gm_gate[6];      // what it waited for (seq, part, submission) and the done values then
 
 // MKW_PS5_GPUMEM_LOG=IP:PORT: one UDP datagram a line to a listener (a UDP listener on the LAN). Not a file:
 // a write(2) to /data a call stalled the title (run 130: 0.1x speed, allocations ~950 ms each; cf. Step 4 run 12's
 // unbuffered stdio on /data), and a datagram already sent survives the fault that ends the title. The frees of empty
 // memory (address 0: the winsys's per-submission dedicated slot, radv_ps5_cs.c:395) are not sent.
-static __attribute__((noinline)) void gm_line(char kind, uint64_t va, uint64_t bytes) {
-    if (!va) return;
+static void gm_open(void) {
     if (gm_fd == -2) {
         const char *e = getenv("MKW_PS5_GPUMEM_LOG");
         int fd = -1;
@@ -747,6 +748,31 @@ static __attribute__((noinline)) void gm_line(char kind, uint64_t va, uint64_t b
         if (!__atomic_compare_exchange_n(&gm_fd, &was, fd, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) && fd >= 0) close(fd);
         else if (fd >= 0) fprintf(stderr, "[host] ps5: RADV's memory allocations and frees go to %s by UDP (MKW_PS5_GPUMEM_LOG)\n", e);
     }
+}
+
+// vk_mem_upload.c (weak there): whether the log is on; the deferring thread's return addresses (offsets, as gm_line's);
+// the object being destroyed by collect_locked, whose why[] and gate go on the lines of the frees it causes (NULL after).
+int ps5_gm_on(void) {
+    gm_open();
+    return __atomic_load_n(&gm_fd, __ATOMIC_ACQUIRE) >= 0;
+}
+__attribute__((noinline)) int ps5_gm_stack(uint64_t *w, int n) {
+    if (!text_hi) text_range();
+    const uint64_t *sp = (const uint64_t *)__builtin_frame_address(0);
+    int got = 0;
+    for (int i = 0; i < 400 && got < n; i++)
+        if (sp[i] >= text_lo && sp[i] < text_hi) w[got++] = sp[i] - text_lo;
+    return got;
+}
+void ps5_gm_dying(const uint64_t *why, uint64_t seq, uint64_t tl, uint64_t fence, uint64_t done_seq, uint64_t tl_done,
+                  uint64_t fdone) {
+    gm_why = why;
+    gm_gate[0] = seq, gm_gate[1] = tl, gm_gate[2] = fence, gm_gate[3] = done_seq, gm_gate[4] = tl_done, gm_gate[5] = fdone;
+}
+
+static __attribute__((noinline)) void gm_line(char kind, uint64_t va, uint64_t bytes) {
+    if (!va) return;
+    gm_open();
     int fd = __atomic_load_n(&gm_fd, __ATOMIC_ACQUIRE);
     if (fd < 0) return;
     if (!text_hi) text_range();
@@ -754,7 +780,7 @@ static __attribute__((noinline)) void gm_line(char kind, uint64_t va, uint64_t b
     clock_gettime(CLOCK_REALTIME, &ts);
     struct tm tm;
     gmtime_r(&ts.tv_sec, &tm);
-    char b[256];
+    char b[640];
     int k = snprintf(b, sizeof b, "%02d:%02d:%02d.%03ld %c %#llx %#llx %llu", tm.tm_hour, tm.tm_min, tm.tm_sec,
                      ts.tv_nsec / 1000000, kind, (unsigned long long)va, (unsigned long long)bytes,
                      (unsigned long long)__atomic_add_fetch(&gm_n, 1, __ATOMIC_RELAXED));
@@ -762,6 +788,17 @@ static __attribute__((noinline)) void gm_line(char kind, uint64_t va, uint64_t b
     for (int i = 0, got = 0; i < 160 && got < 6 && k < (int)sizeof b - 24; i++) {   // this thread's own stack
         uint64_t v = sp[i];
         if (v >= text_lo && v < text_hi) k += snprintf(b + k, sizeof b - (size_t)k, " %#llx", (unsigned long long)(v - text_lo)), got++;
+    }
+    // A free caused by a deferred destruction: "| D kind path tl_noted seq/tl/fence done done_seq/tl/fdone" and the
+    // deferring stack (the port's log tool symbolises it too).
+    if (gm_why) {
+        k += snprintf(b + k, sizeof b - (size_t)k, " | D %llu %llu %llu %llu/%llu/%llu done %llu/%llu/%llu",
+                      (unsigned long long)(gm_why[0] & 0xff), (unsigned long long)(gm_why[0] >> 8),
+                      (unsigned long long)gm_why[1], (unsigned long long)gm_gate[0], (unsigned long long)gm_gate[1],
+                      (unsigned long long)gm_gate[2], (unsigned long long)gm_gate[3], (unsigned long long)gm_gate[4],
+                      (unsigned long long)gm_gate[5]);
+        for (int i = 2; i < 10 && gm_why[i] && k < (int)sizeof b - 24; i++)
+            k += snprintf(b + k, sizeof b - (size_t)k, " %#llx", (unsigned long long)gm_why[i]);
     }
     (void)!sendto(fd, b, (size_t)k, 0, (const struct sockaddr *)&gm_to, sizeof gm_to);
 }
