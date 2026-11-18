@@ -32,6 +32,7 @@ typedef SOCKET HostSock;
 #else
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/in.h>   // IPPROTO_UDP: glibc's netdb.h brings it, the PS5 SDK's does not
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
