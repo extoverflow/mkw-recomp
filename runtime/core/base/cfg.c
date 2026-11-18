@@ -311,9 +311,8 @@ static const struct { const char *key, *value; } DECK[] = {
 // title's 16,384 CPU page tables per 2 MiB, and the two terrain arrays used them all up (SPARSE_IMAGES, TEX_MAX as on
 // Turnip: vk_tex_image.c); fast-linked library pipelines drew without a vertex stage (radv_get_vgt_shader_key read
 // 0x199: GPL); with GPL off, builds are slow enough that skipped full-screen draws left the whole 3D scene black for a
-// frame, 4 times in 15.7 s at the menu, none in 40 s with PIPE_SKIP=strict (recordings v01/v02). GPU_MEM_LIMIT stays
-// the integrated-GPU default (4096): 6144 let the pool's largest free block fall to 3.7 MiB at 300 s (run 28:
-// the game went on, slow and glitchy).
+// frame, 4 times in 15.7 s at the menu, none in 40 s with PIPE_SKIP=strict (recordings v01/v02). GPU_MEM_LIMIT: 6144
+// let the pool's largest free block fall to 3.7 MiB at 300 s (run 28: the game went on, slow and glitchy); 4608 below.
 static const struct { const char *key, *value; } PS5[] = {
     {"MESH_COMPUTE", "1"}, {"PIPE_WORKERS", "4"}, {"SPARSE_IMAGES", "0"}, {"TEX_MAX", "1024"}, {"GPL", "0"},
     {"PIPE_SKIP", "strict"},
@@ -326,9 +325,12 @@ static const struct { const char *key, *value; } PS5[] = {
     // pages invalidates the buffer, vk_mem_shadow.c:16-23) the PS5 does not have; the guest's pages carry the GPU bits
     // (ps5_mem.c). Races 20-30 -> ~45 fps and 528 MiB of GPU memory back (runs 57 and 60, 13/11/2026).
     {"SHADOW", "0"},
-    // The GPU's cap stays 4 GiB: upstream's integrated default (40 % of the RAM, 46a3c2e #174) gives 4864 MiB from the
-    // title's 12 GiB, the same pool the guest's memory comes from (rebased run 73: 1.1 GB less free at 9 min than run 72).
-    {"GPU_MEM_LIMIT", "4096"},
+    // The GPU's cap 4608 MiB. At 4096 a race's 3072x3072x3 shadow map could not be made ("vk: image creation failed
+    // (-2)", the heap full) and was sampled as a zero stand-in: the scene flipped between lit and dark frames (run 147).
+    // 4608: no image failure in runs 148-164, the title's direct memory at 541-953 MiB free at worst. Upstream's
+    // integrated default (40 % of the RAM, 46a3c2e #174) gives 4864 MiB from the title's 12 GiB, the same pool the
+    // guest's memory comes from (rebased run 73: 1.1 GB less free at 9 min than run 72).
+    {"GPU_MEM_LIMIT", "4608"},
     // Map-sized textures (just under 8192 texels) cut to 4096 a side: at full size they did not fit the cap (run 87).
     {"TEX_LARGE", "4096"},
     // A race frame recorded on 6 threads in chunks of 160 draws (the first 32): the game finishes submitting a frame
