@@ -556,6 +556,11 @@ static const struct { const char *key, *value; } PS5[] = {
     // integrated default (40 % of the RAM, 46a3c2e #174) gives 4864 MiB from the title's 12 GiB, the same pool the
     // guest's memory comes from (rebased run 73: 1.1 GB less free at 9 min than run 72).
     {"GPU_MEM_LIMIT", "4608"},
+    // Layered depth clears one layer at a time (vk_exec_clear.c, MKW_DEPTH_CLEAR_ALL): with every layer cleared at once,
+    // upstream's default, a course's plaza flipped between its lighting and none from frame to frame on the console, in
+    // serial replay too (run 152; the clear counts were exact, the suspect is the driver's fast clear of all layers).
+    // Off: no flip, no frame rate cost (runs 153-156).
+    {"DEPTH_CLEAR_ALL", "0"},
     // Map-sized textures (just under 8192 texels) cut to 4096 a side: at full size they did not fit the cap (run 87).
     {"TEX_LARGE", "4096"},
     // A race frame recorded on 6 threads in chunks of 160 draws (the first 32): the game finishes submitting a frame
