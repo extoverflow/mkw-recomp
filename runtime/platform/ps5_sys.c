@@ -293,6 +293,14 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb) {
 
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) { *resident = *private_bytes = 0; }
 
+// linux_sys.c:556 (upstream 3042c59) is malloc_trim(0) after a large release of small blocks. The PS5's heap is the SDK
+// fork's platform heap, whose ps5_heap_trim gives back each arena's free top and empty segments (ps5_main.c mem_watch
+// calls it every 10 s too); weak: an older SDK has none.
+__attribute__((weak)) void ps5_heap_trim(void);
+void plat_heap_trim(void) {
+    if (ps5_heap_trim) ps5_heap_trim();
+}
+
 int64_t plat_threads_cpu_ns_named(const char *name) {
     (void)name;
     return -1;

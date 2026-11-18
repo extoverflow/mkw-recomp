@@ -159,6 +159,12 @@ int plat_file_sync(FILE *f) { return !fflush(f) && !fsync(fileno(f)); }
 
 void plat_file_delete(const char *path) { unlink(path); }
 
+// linux_fs.c:180 (upstream 3042c59): the modification time in ns, 0 when missing; FreeBSD's stat has st_mtim too.
+uint64_t plat_path_write_time(const char *path) {
+    struct stat st;
+    return stat(path, &st) ? 0 : (uint64_t)st.st_mtim.tv_sec * 1000000000u + (uint64_t)st.st_mtim.tv_nsec;
+}
+
 int64_t plat_file_size(const char *path) {
     struct stat st;
     return stat(path, &st) ? -1 : (int64_t)st.st_size;

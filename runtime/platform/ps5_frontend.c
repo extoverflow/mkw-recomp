@@ -42,6 +42,14 @@ int input_hack_key(int which) {
     return 0;
 }
 
+// input_power.c (upstream 3042c59) asks the Switch 2 controllers' battery first: none here (0, as switch2.c for a pad
+// that is not one of its own)
+int switch2_battery(uint32_t sdl_id, int *mv) {
+    (void)sdl_id;
+    if (mv) *mv = 0;
+    return 0;
+}
+
 // ---- racing wheels (input/wheel.c, upstream 3042c59): SDL's joystick API maps wheels as gamepads; the console's pads
 // come from scePad (platform/ps5_sdl.c), and no wheel is opened there
 void input_wheel_hint(void) {}
