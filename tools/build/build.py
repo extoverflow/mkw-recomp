@@ -162,11 +162,14 @@ PS5 = Target(
 # window; input.c and audio_mixer.c build against ps5_sdl's SDL3 subset). switch2.c's Switch 2 controllers
 # come over Bluetooth LE through a transport the console does not have (linux_switch2.c, switch2_win.c).
 PS5_WITHOUT = {"gfx/nvn/host/gfx_window_sdl.c",
-               "input/input_sdl.c", "input/switch2.c", "third_party/imgui/backends/imgui_impl_sdl3.cpp",
+               "input/input_sdl.c", "input/switch2.c", "input/wheel.c", "third_party/imgui/backends/imgui_impl_sdl3.cpp",
                "third_party/imgui/backends/imgui_impl_sdlrenderer3.cpp", "ui/launcher/launcher.cpp",
                "ui/launcher/launcher_backdrop.cpp", "ui/launcher/launcher_lastrun.cpp", "ui/launcher/launcher_tools.cpp", "ui/launcher/launcher_setup.cpp", "ui/launcher/launcher_update.cpp",
                "ui/launcher/mods.cpp", "ui/launcher/mods_browse.cpp",  # the launcher's mod manager: launcher.cpp alone
                "ui/menu/menu_sdl.cpp"}  # fmt: skip
+# The start screen's folder whole: upstream adds pages to it (3042c59: launcher_brand, launcher_finddumps), all SDL3
+# windows and renderers; the PS5 has no start screen (ps5_frontend.c launcher_run).
+PS5_WITHOUT_DIRS = ("ui/launcher/",)
 WINDOWS = Target(
     str(WIN / "llvm-mingw/bin/x86_64-w64-mingw32-clang"), str(WIN / "llvm-mingw/bin/x86_64-w64-mingw32-clang++"),
     str(WIN / "llvm-mingw/bin/llvm-ar"), ROOT / "build/mkw.exe",
@@ -210,11 +213,12 @@ def mem_total_gb() -> float:
 def runtime_sources(target: Target) -> list[Path]:
     """Every runtime .c/.cpp of the target. Linux: no Win32 file (*_win.*, platform/win32*.c). Windows: no
     platform/linux*.c. Neither: platform/ps5*.c. PS5: no Linux or Windows file, and not the SDL3 front end
-    (PS5_WITHOUT; platform/ps5_frontend.c stands in for it)."""
+    (PS5_WITHOUT and the whole start screen, PS5_WITHOUT_DIRS; platform/ps5_frontend.c stands in for them)."""
     srcs = [*RUNTIME.rglob("*.c"), *RUNTIME.rglob("*.cpp")]
     if target is PS5:
         return sorted(p for p in srcs if not p.stem.endswith("_win") and not p.stem.startswith(("win32", "linux"))
-                      and str(p.relative_to(RUNTIME)) not in PS5_WITHOUT)  # fmt: skip
+                      and str(p.relative_to(RUNTIME)) not in PS5_WITHOUT
+                      and not str(p.relative_to(RUNTIME)).startswith(PS5_WITHOUT_DIRS))  # fmt: skip
     srcs = [p for p in srcs if not p.stem.startswith("ps5")]
     if target is LINUX:
         return sorted(p for p in srcs if not p.stem.endswith("_win") and not p.stem.startswith("win32"))
