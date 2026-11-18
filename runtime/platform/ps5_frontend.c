@@ -42,6 +42,11 @@ int input_hack_key(int which) {
     return 0;
 }
 
+// ---- racing wheels (input/wheel.c, upstream 3042c59): SDL's joystick API maps wheels as gamepads; the console's pads
+// come from scePad (platform/ps5_sdl.c), and no wheel is opened there
+void input_wheel_hint(void) {}
+void input_wheel_map(void) {}
+
 // ---- window: platform/ps5_window.c
 
 // ---- start screen (launcher.cpp): none; straight into the mode asked for
