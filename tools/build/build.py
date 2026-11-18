@@ -128,7 +128,7 @@ PS5 = Target(
     # -isystem: searched after the runtime's -I list, so PS5_LIBS's own imgui.h does not shadow runtime/third_party's
     # IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS: ImGui's link opener forks, and a title has no fork
     # platform/ps5_sdl: the SDL3 subset input.c and audio_mixer.c call (platform/ps5_sdl.c), the console has no SDL3
-    ["-msha", "-DIMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS", f"-I{RUNTIME / 'platform/ps5_sdl'}",
+    ["-msha", "-DIMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS", f"-I{RUNTIME / 'ps5_sdl'}",
      f"-include{RUNTIME / 'platform/ps5_compat.h'}",
      f"-isystem{PS5_LIBS / 'include'}",
      f"-isystem{ROOT / 'build/ps5-deps/include'}"],
@@ -136,7 +136,7 @@ PS5 = Target(
     ROOT / "scratchpad/vma",
 )  # fmt: skip
 # The SDL3 front end's window, keyboard, start screen and menu events: not on the PS5 (platform/ps5_window.c is its
-# window; input.c and audio_mixer.c build against platform/ps5_sdl's SDL3 subset). switch2.c's Switch 2 controllers
+# window; input.c and audio_mixer.c build against ps5_sdl's SDL3 subset). switch2.c's Switch 2 controllers
 # come over Bluetooth LE through a transport the console does not have (linux_switch2.c, switch2_win.c).
 PS5_WITHOUT = {"gfx/nvn/host/gfx_window_sdl.c",
                "input/input_sdl.c", "input/switch2.c", "third_party/imgui/backends/imgui_impl_sdl3.cpp",
