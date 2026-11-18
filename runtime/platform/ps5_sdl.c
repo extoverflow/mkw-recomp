@@ -202,6 +202,14 @@ void SDL_CloseGamepad(SDL_Gamepad *g) {
 bool SDL_GamepadConnected(SDL_Gamepad *g) { return g && g->handle >= 0 && g->connected; }
 SDL_JoystickID SDL_GetGamepadID(SDL_Gamepad *g) { return g ? (SDL_JoystickID)(g - g_pads + 1) : 0; }
 const char *SDL_GetGamepadName(SDL_Gamepad *g) { return g ? "PS5 controller" : NULL; }
+// input.c (upstream 3042c59) keys its dead zone on the pad's type and vendor: a DualSense, Sony's vendor id
+SDL_GamepadType SDL_GetGamepadType(SDL_Gamepad *g) { return g ? SDL_GAMEPAD_TYPE_PS5 : SDL_GAMEPAD_TYPE_UNKNOWN; }
+Uint16 SDL_GetGamepadVendor(SDL_Gamepad *g) { return g ? 0x054c : 0; }
+// The battery rows (input_power.c): not read from scePad yet, so unknown, as SDL reports a pad it cannot query
+SDL_PowerState SDL_GetGamepadPowerInfo(SDL_Gamepad *g, int *percent) {
+    if (percent) *percent = -1;
+    return g ? SDL_POWERSTATE_UNKNOWN : SDL_POWERSTATE_ERROR;
+}
 SDL_PropertiesID SDL_GetGamepadProperties(SDL_Gamepad *g) { return SDL_GetGamepadID(g); }
 
 bool SDL_GetBooleanProperty(SDL_PropertiesID props, const char *name, bool default_value) {
@@ -446,6 +454,14 @@ bool SDL_PutAudioStreamData(SDL_AudioStream *s, const void *buf, int len) {
 
 SDL_AudioDeviceID SDL_GetAudioStreamDevice(SDL_AudioStream *s) { return s ? DEVICE : 0; }
 const char *SDL_GetAudioDeviceName(SDL_AudioDeviceID devid) { return devid ? "PS5 AudioOut (main)" : NULL; }
+// Upstream's rate matching (audio_mixer.c, 3042c59) asks the stream to resample by a ratio that follows the device's
+// real rate. The AudioOut port takes a grain (GRAIN frames) per output period at its fixed RATE, which is how the PS5
+// played before that change: the ratio is kept and not applied (a resampler here would be its own change).
+bool SDL_SetAudioStreamFrequencyRatio(SDL_AudioStream *s, float ratio) {
+    if (!s || !(ratio > 0)) return fail("bad frequency ratio");
+    return true;
+}
+const char *SDL_GetCurrentAudioDriver(void) { return "ps5"; }
 
 void SDL_DestroyAudioStream(SDL_AudioStream *s) {
     if (!s) return;
