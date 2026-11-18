@@ -17,6 +17,7 @@ behind that code was seen there, not in MKW.
 | [input/](input/README.md) | Controllers, keyboard, mouse, gyro |
 | [gfx/](gfx/README.md) | NVN over Vulkan: API front end (`nvn/`) and back end (`vk/`) |
 | [platform/](platform/README.md) | Operating system layer: `linux.c`, `win32.c` |
+| [ps5_sdl/](ps5_sdl/README.md) | PS5 build only: the SDL3 subset its input and audio call (`<SDL3/SDL.h>`) |
 | [ui/](ui/README.md) | Menu and overlay (Dear ImGui) |
 | [shaders/](shaders/README.md) | The runtime's own shaders (ASTC, FSR 1) |
 | [probes/](probes/README.md) | Self-tests per subsystem |

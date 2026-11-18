@@ -1,4 +1,4 @@
-// PS5 build only (tools/build/build.py puts runtime/platform/ps5_sdl first on the include path): the part of SDL3's
+// PS5 build only (tools/build/build.py puts runtime/ps5_sdl first on the include path): the part of SDL3's
 // API that input/input.c and audio/audio_mixer.c call, so they build unchanged on the console, where there is no SDL3.
 // platform/ps5_sdl.c implements it on scePad and sceAudioOut. Names, signatures and the order of the enumerations
 // follow SDL3's public API (SDL_gamepad.h, SDL_joystick.h, SDL_sensor.h, SDL_audio.h, SDL_init.h); everything else of
@@ -90,6 +90,19 @@ void SDL_CloseGamepad(SDL_Gamepad *gamepad);
 bool SDL_GamepadConnected(SDL_Gamepad *gamepad);
 SDL_JoystickID SDL_GetGamepadID(SDL_Gamepad *gamepad);
 const char *SDL_GetGamepadName(SDL_Gamepad *gamepad);
+// upstream 3042c59: input.c's Xbox dead zone (the pad's type and vendor) and the battery rows (input_power.c), with
+// SDL3's values. The console's pads are DualSense controllers (Sony, 0x054c); their battery is not read yet.
+typedef enum SDL_GamepadType {
+    SDL_GAMEPAD_TYPE_UNKNOWN = 0, SDL_GAMEPAD_TYPE_STANDARD, SDL_GAMEPAD_TYPE_XBOX360, SDL_GAMEPAD_TYPE_XBOXONE,
+    SDL_GAMEPAD_TYPE_PS3, SDL_GAMEPAD_TYPE_PS4, SDL_GAMEPAD_TYPE_PS5
+} SDL_GamepadType;
+typedef enum SDL_PowerState {
+    SDL_POWERSTATE_ERROR = -1, SDL_POWERSTATE_UNKNOWN, SDL_POWERSTATE_ON_BATTERY, SDL_POWERSTATE_NO_BATTERY,
+    SDL_POWERSTATE_CHARGING, SDL_POWERSTATE_CHARGED
+} SDL_PowerState;
+SDL_GamepadType SDL_GetGamepadType(SDL_Gamepad *gamepad);
+Uint16 SDL_GetGamepadVendor(SDL_Gamepad *gamepad);
+SDL_PowerState SDL_GetGamepadPowerInfo(SDL_Gamepad *gamepad, int *percent);
 SDL_PropertiesID SDL_GetGamepadProperties(SDL_Gamepad *gamepad);
 SDL_GamepadButtonLabel SDL_GetGamepadButtonLabel(SDL_Gamepad *gamepad, SDL_GamepadButton button);
 void SDL_UpdateGamepads(void);
@@ -122,6 +135,10 @@ bool SDL_ResumeAudioStreamDevice(SDL_AudioStream *stream);
 bool SDL_PutAudioStreamData(SDL_AudioStream *stream, const void *buf, int len);
 SDL_AudioDeviceID SDL_GetAudioStreamDevice(SDL_AudioStream *stream);
 const char *SDL_GetAudioDeviceName(SDL_AudioDeviceID devid);
+// upstream 3042c59's rate matching (audio_mixer.c): the AudioOut port plays at its own fixed rate; the ratio is taken
+// and not applied (ps5_sdl.c), the driver is named "ps5"
+bool SDL_SetAudioStreamFrequencyRatio(SDL_AudioStream *stream, float ratio);
+const char *SDL_GetCurrentAudioDriver(void);
 void SDL_DestroyAudioStream(SDL_AudioStream *stream);
 
 // ---- SDL_video.h (display modes): ui/menu/settings_tabs.cpp asks the primary display's height when the game window
