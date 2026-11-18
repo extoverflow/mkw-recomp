@@ -1,4 +1,4 @@
-# runtime/platform/ps5_sdl/SDL3
+# runtime/ps5_sdl/SDL3
 
 | File | What it is |
 |---|---|

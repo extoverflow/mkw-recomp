@@ -22,7 +22,7 @@
 | `ps5_mem.c` | PS5: reservations, direct memory backed at the first touch per 16 KiB page, the 4 KiB guest state, faults and crashes |
 | `ps5_frontend.c` | PS5: stand-ins for the parts of the SDL3 front end a console has no use for (keyboard, mouse, start screen) |
 | `ps5_window.c` | PS5: the window back end (`gfx_wsys.h`) on the one display through RADV's `VK_KHR_display` |
-| `ps5_sdl.c`, `ps5_sdl/SDL3/SDL.h` | PS5: the SDL3 subset `input/input.c` and `audio/audio_mixer.c` call, on scePad and sceAudioOut |
+| `ps5_sdl.c` (with `../ps5_sdl/SDL3/SDL.h`) | PS5: the SDL3 subset `input/input.c` and `audio/audio_mixer.c` call, on scePad and sceAudioOut |
 | `ps5_vk.c` | PS5: the Vulkan entry points the runtime calls by name, each asking the linked-in RADV for its own (written by the port's generator script from RADV's `vulkan_core.h`) |
 | `ps5_sync.c` | PS5: clock, locks and condition variables (`linux_sync.c` on FreeBSD's `_umtx_op`) |
 | `ps5_fs.c` | PS5: files and file system (`linux_fs.c`; no `renameat2`, the temporary directory under `/data`) |
