@@ -467,6 +467,11 @@ uint64_t plat_cpu_fast(void) {
     return cpuset_mask(&m) ? m : 0;
 }
 
+// linux.c:184 (upstream 3042c59) puts a background thread on every processor the process had at start, so a hybrid
+// CPU's efficiency cores take it while the frame's threads keep the fast ones; Windows does nothing. The PS5's cores are
+// alike (plat_cpu_fast): nothing to move.
+void plat_thread_background(void) {}
+
 int plat_process_affinity(uint64_t mask) {
     cpuset_t set;
     CPU_ZERO(&set);
