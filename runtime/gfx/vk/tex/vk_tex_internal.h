@@ -44,6 +44,9 @@ typedef struct Tex {
     uint64_t rel_bytes;           // while released: its own memory, counted in released_bytes
     uint64_t shash;               // XXH3 of the storage at the last upload (same_storage: no write watch)
     uint32_t shash_epoch;         // submit_epoch of the last hash check
+    uint64_t whash;               // MKW_TEX_HASH_WRITTEN: XXH3 of the storage when it was last uploaded (whashed: set)
+    uint64_t wfence;              // wr_fence then: a GPU write to the image since means the upload is needed
+    uint8_t whashed;
     uint8_t sparse;               // a Vulkan sparse image whose tiles follow the game's MapVirtual (vk_sparse.c)
     VkSparseTail sparse_tail;      // privately backed small mips; zeroed at image initialization, without touching shared tiles
     uint64_t use;                 // MKW_GPU_GUARD: newest submission part that looked it up (vk_guard_note)

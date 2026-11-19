@@ -619,6 +619,44 @@ static int same_storage(Tex *e) {
     return 0;
 }
 
+// MKW_TEX_HASH_WRITTEN=1 (PS5 profile): a texture whose pages the write watch shows written is uploaded again only
+// when its storage's hash differs from the one taken at its last upload, or the GPU wrote the image since (wr_fence).
+// On the PS5 the watch is coarser than a texture (its 16 KiB pages and 2 MiB stretches, ps5_mem.c) and the game writes
+// next to its textures: in run 185 (cup 0 from a cold start, 19 min, MKW_TEX_UPSTATS) 55,546 uploads again had the
+// same bytes as the texture's last upload, 17.8 GiB and 491 s of upload time with the GPU's ASTC work, against 182 with
+// changed bytes: the first-session minutes at 1-10 fps. The hash (XXH3) is taken before the storage is read, as
+// note_storage's: a write while uploading costs one upload more instead of being missed.
+static uint64_t n_hash_skips, n_hash_checks;
+static int hash_written(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *c = cfg_get("MKW_TEX_HASH_WRITTEN");
+        on = c && *c && atoi(c) != 0;
+        if (on) rt_log("vk: textures written in their pages upload again only when their bytes changed (MKW_TEX_HASH_WRITTEN)");
+    }
+    return on;
+}
+// Before an upload: the hash it is checked against next time.
+static void note_written(Tex *e) {
+    if (!hash_written() || !e->t.mem) return;
+    e->whash = vk_texpre_hash(e->t.mem, e->t.L.size), e->wfence = e->wr_fence, e->whashed = 1;
+}
+// A "written" check: 1 when the bytes are those of the last upload and the GPU has not written the image since.
+static int written_same(Tex *e) {
+    if (!hash_written() || !e->t.mem || !e->whashed || e->gpu_dirty || e->wr_fence != e->wfence) return 0;
+    uint64_t h = vk_texpre_hash(e->t.mem, e->t.L.size);
+    n_hash_checks++;
+    if (h != e->whash) {
+        e->whash = h, e->wfence = e->wr_fence;   // upload() follows: this hash is its storage's
+        return 0;
+    }
+    n_hash_skips++;
+    if (!(n_hash_skips & (n_hash_skips - 1)) && n_hash_skips >= 1024)
+        rt_log("vk: %llu uploads of written textures skipped, bytes unchanged (%llu checked)",
+               (unsigned long long)n_hash_skips, (unsigned long long)n_hash_checks);
+    return 1;
+}
+
 // A mirrored texture is uploaded on first use and again when its storage pages carry a newer write generation.
 void make_fresh(Tex *e) {
     if (!e->pub.mirrored || e->pub.gpu_owned) return;
@@ -626,6 +664,7 @@ void make_fresh(Tex *e) {
     if (!e->uploaded) {
         vk_mem_changed(e->pub.addr, size, 0, &e->wgen);   // resets the write bits before the storage is read
         note_storage(e);
+        note_written(e);
         upload(e);
         return;
     }
@@ -634,6 +673,7 @@ void make_fresh(Tex *e) {
     e->wgen = now;
     e->last_ch = ch;
     if (ch < 0 && e->t.mem && same_storage(e)) return;   // not tracked: the hash decides
+    if (ch > 0 && written_same(e)) return;               // written pages, same bytes (MKW_TEX_HASH_WRITTEN)
     if (ch) upload(e);   // 1 written, -1 not tracked and rewritten: both upload again
 }
 
@@ -654,11 +694,13 @@ void make_fresh_snap(Tex *e) {
     e->wgen = now;
     if (!e->uploaded) {
         note_storage(e);
+        note_written(e);
         upload(e);
         return;
     }
     e->last_ch = ch;
     if (ch < 0 && e->t.mem && same_storage(e)) return;   // not tracked: the hash decides
+    if (ch > 0 && written_same(e)) return;               // written pages, same bytes (MKW_TEX_HASH_WRITTEN)
     if (ch) upload(e);
 }
 

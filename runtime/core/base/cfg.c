@@ -359,6 +359,7 @@ static const CfgRow rows[] = {
     K("TEMPORAL_KART_CIRCLE"),
     K("TEMPORAL_KART_DEPTH"),
     K("TEMPORAL_NGX"),
+    K("TEX_HASH_WRITTEN"),
     K("TEX_LARGE"),
     K("TEX_OVERWRITTEN"),
     K("TEX_PRESSURE"),
@@ -563,6 +564,9 @@ static const struct { const char *key, *value; } PS5[] = {
     {"DEPTH_CLEAR_ALL", "0"},
     // Map-sized textures (just under 8192 texels) cut to 4096 a side: at full size they did not fit the cap (run 87).
     {"TEX_LARGE", "4096"},
+    // A texture whose pages were written is uploaded again only when its bytes changed (vk_tex_upload.c): run 185 spent
+    // 491 s of its first 19 min uploading 55,546 textures again with the same bytes.
+    {"TEX_HASH_WRITTEN", "1"},
     // A race frame recorded on 6 threads in chunks of 160 draws (the first 32): the game finishes submitting a frame
     // in ~11 ms and one replay thread then needed ~15 ms of CPU, so the frame ended ~19 ms after it began (run 99,
     // MKW_TRACE_TL). Run 103 (30 min of Grand Prix): recording ends 1.5 ms after the game's last submit, a frame every
