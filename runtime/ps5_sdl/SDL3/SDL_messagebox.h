@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// The part of SDL3's SDL_messagebox.h that core/boot/main.c calls (its AVX2 check, upstream 9895782, #262), with
+// The part of SDL3's SDL_messagebox.h that core/boot/main.c (its AVX2 check, upstream 9895782, #262) and plugin/plugin.c
+// (a mod's plugin that failed to load, upstream ed04f94) call, with
 // SDL3's names. The PS5 has no message box here: the call shows nothing and reports failure, as SDL does without a
 // video driver; main.c writes the message to stderr (the title's log) before it. The PS5's Zen 2 has AVX2 anyway.
 #pragma once
 #include <stdbool.h>
 
 #define SDL_MESSAGEBOX_ERROR 0x00000010u
+#define SDL_MESSAGEBOX_WARNING 0x00000020u
+#define SDL_MESSAGEBOX_INFORMATION 0x00000040u
 
 typedef struct SDL_Window SDL_Window;
 typedef unsigned int SDL_MessageBoxFlags;
