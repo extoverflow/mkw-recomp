@@ -52,7 +52,7 @@ static const char *const known[] = {
     "REPLAY_CHECK", "REPLAY_PAR", "REPLAY_PAR_DRAWS", "REPLAY_PAR_FIRST", "REPLAY_PAR_THREADS", "RESOLUTION", "RESOLUTION_3D", "RESOLVE_CHECK", "ROMFS", "RTSTATS", "ROMFS_MODS", "ROMFS_PATCHES",
     "RUMBLE", "RUMBLE_CURVE", "RUMBLE_STRENGTH", "RUMBLE_TRIGGERS",
     "SHADER_MEMO", "SHADOW", "SHADOW_SIZE", "SHARED_FONTS", "SHARPNESS", "SHORTCUT_ASKED", "SHOTS", "SHOTS_DIR", "SHOTS_FULL", "SPARSE_IMAGES", "SPARSE_MIB", "SPARSE_NO_BUFFER", "SPIN", "SPIN_HANDOFF_US", "SPLIT_DRAWS", "SPLIT_US", "STEAM_X11", "STICK_DEADZONE", "SWITCH2", "SWKBD_ANSWER",
-    "SKIP_PROGRAMS", "SWKBD_TEST", "TEX_ALIAS", "TEX_LARGE", "TEX_MEMO", "TEX_QUALITY", "TEX_OVERWRITTEN", "TEX_RELEASED_MIB", "TIMER_1MS", "TRACE", "TURBO", "TURBO_SPEED", "SKIP_MOVIES", "SEED", "UNLOCK_ALL", "QUICK_RACE", "FREEZE_KEYS", "QUALITY", "TRACE_UBO", "TRACE_UBO_OUT", "UBO_SNAPSHOT", "UPSCALER", "VRR", "VK_DYN_A2C", "VK_DYN_VERTEX", "VK_NO_FLOAT64",
+    "SKIP_PROGRAMS", "SWKBD_TEST", "TEX_ALIAS", "TEX_HASH_WRITTEN", "TEX_LARGE", "TEX_MEMO", "TEX_QUALITY", "TEX_OVERWRITTEN", "TEX_RELEASED_MIB", "TIMER_1MS", "TRACE", "TURBO", "TURBO_SPEED", "SKIP_MOVIES", "SEED", "UNLOCK_ALL", "QUICK_RACE", "FREEZE_KEYS", "QUALITY", "TRACE_UBO", "TRACE_UBO_OUT", "UBO_SNAPSHOT", "UPSCALER", "VRR", "VK_DYN_A2C", "VK_DYN_VERTEX", "VK_NO_FLOAT64",
     "VK_PRESENT", "VK_RECORDER", "VK_SSBO_ALIGN", "VK_SUBGROUP", "VK_SUBGROUP_PIN", "VK_TEX_POOL_MIN", "VK_VALIDATION", "VOLUME", "VRAM_HEADROOM", "VRAM_LOG", "VRAM_MARGIN", "VS_OUTS",
     "UPDATE_AS", "UPDATE_CHECK", "UPDATE_REPO", "START_SCREEN", "WINDOW_SIZE", "ZSTD_CHECK", "ZSTD_NATIVE",
 };
@@ -338,6 +338,9 @@ static const struct { const char *key, *value; } PS5[] = {
     {"DEPTH_CLEAR_ALL", "0"},
     // Map-sized textures (just under 8192 texels) cut to 4096 a side: at full size they did not fit the cap (run 87).
     {"TEX_LARGE", "4096"},
+    // A texture whose pages were written is uploaded again only when its bytes changed (vk_tex_upload.c): run 185 spent
+    // 491 s of its first 19 min uploading 55,546 textures again with the same bytes.
+    {"TEX_HASH_WRITTEN", "1"},
     // A race frame recorded on 6 threads in chunks of 160 draws (the first 32): the game finishes submitting a frame
     // in ~11 ms and one replay thread then needed ~15 ms of CPU, so the frame ended ~19 ms after it began (run 99,
     // MKW_TRACE_TL). Run 103 (30 min of Grand Prix): recording ends 1.5 ms after the game's last submit, a frame every
