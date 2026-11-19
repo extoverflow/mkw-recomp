@@ -9,6 +9,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "SDL_messagebox.h"   // as SDL3's SDL.h includes it (plugin/plugin.c, upstream ed04f94)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
