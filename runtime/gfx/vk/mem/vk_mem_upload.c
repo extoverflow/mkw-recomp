@@ -291,6 +291,19 @@ void vk_mem_relieve(uint64_t bytes, const char *what) {
                (plat_now_ns() - t0) / 1e6);
 }
 
+// The system short of memory (the PS5 title's direct memory, vk_backend.c): released and idle textures worth bytes go,
+// and what the GPU has finished with is freed; no wait for the GPU (the next round, 30 frames on, tries again).
+void vk_mem_give_back(uint64_t bytes) {
+    static uint64_t n;
+    int any = vk_texture_trim(bytes);
+    vk_mem_collect();
+    n++;
+    if (n <= 8 || !(n & (n - 1)))
+        rt_log("vk: system memory short by %.0f MiB: %s (%llu times)", bytes / 1048576.0,
+               any ? "released and idle textures given back" : "no released or idle texture to give back",
+               (unsigned long long)n);
+}
+
 // vk_upload_begin and the caller's staging buffer, before it records anything; out of memory with no other
 // vk_upload_begin of this thread open, vk_mem_relieve outside the batch and both are tried again.
 VkCommandBuffer vk_upload_begin_staging(VkDeviceSize size, VkBuffer *buf, void **map) {

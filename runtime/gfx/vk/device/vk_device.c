@@ -25,6 +25,12 @@ static PlatMutex g_lock = PLAT_MUTEX_INIT;
 static VKAPI_ATTR VkResult VKAPI_CALL timed_alloc(VkDevice d, const VkMemoryAllocateInfo *info,
                                                   const VkAllocationCallbacks *cb, VkDeviceMemory *mem) {
     static int64_t n_slow, ns_all, bytes_all;
+#ifdef __PROSPERO__
+    // The PS5's GPU memory is the title's direct memory: a new block that would leave less than the reserve free is
+    // refused, as at the GPU cap (platform/ps5_main.c ps5_gpu_alloc_ok). VMA's blocks only: imports bring their pages.
+    extern int ps5_gpu_alloc_ok(uint64_t bytes);
+    if (!ps5_gpu_alloc_ok(info->allocationSize)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+#endif
     uint64_t t0 = plat_now_ns();
     VkResult r = vkAllocateMemory(d, info, cb, mem);
     int64_t dt = (int64_t)(plat_now_ns() - t0);

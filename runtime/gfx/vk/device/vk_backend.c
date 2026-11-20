@@ -137,6 +137,15 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     vk_exec_present_note(frame);   // before vk_exec_frame_log, which resets the frame's draw counts
     vk_exec_frame_log(t, frame);
     vk_mem_census(frame);
+#ifdef __PROSPERO__
+    // The PS5 title's direct memory below the reserve: idle textures give their memory back (platform/ps5_main.c
+    // ps5_dmem_short), as at the GPU cap, so the GPU's share shrinks while the guest's grows.
+    if (frame % 30 == 0) {
+        extern uint64_t ps5_dmem_short(void);
+        uint64_t short_by = ps5_dmem_short();
+        if (short_by) vk_mem_give_back(short_by);
+    }
+#endif
     if (vk_dump_armed) vk_dump_present(frame);
     __atomic_store_n(&gfx_counters.validation_errors, (uint64_t)vk_validation_errors_total(), __ATOMIC_RELAXED);
     const VkTexImage *img = vk_texture_get(t);
