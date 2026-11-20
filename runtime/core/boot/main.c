@@ -66,7 +66,13 @@ static size_t g_log_early_n;
 static uint64_t g_log_bytes;
 
 void rt_log_raw(const char *p, size_t n) {
-    fwrite(p, 1, n, stderr);
+#ifdef __PROSPERO__
+    // the PS5 title's lines go to a queue its own thread writes (platform/ps5_main.c): a blocked write to the log
+    // stopped every thread that logged, ~1 s at a time (19/11/2026)
+    extern int ps5_log_queue(const char *p, size_t n);
+    if (!ps5_log_queue(p, n))
+#endif
+        fwrite(p, 1, n, stderr);
     int state = __atomic_load_n(&g_log_state, __ATOMIC_ACQUIRE);
     if (state == LOG_EARLY) {
         size_t at = __atomic_fetch_add(&g_log_early_n, n, __ATOMIC_RELAXED);

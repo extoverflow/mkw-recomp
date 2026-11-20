@@ -763,7 +763,9 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
     if (in_module && dladdr((void *)plat_crash_hook, &self)) ours = at.dli_fbase == self.dli_fbase;
     {   // A raw line first: the crash report below takes the log stream's and the heap's locks, and a thread stopped
         // holding one of them turned crashes into hangs with nothing logged (play test p4: picture frozen, log and
-        // thread dump silent). write(2) takes no lock.
+        // thread dump silent). write(2) takes no lock. The log lines still queued go first (ps5_main.c).
+        extern __attribute__((weak)) void ps5_log_drain_raw(void);
+        if (ps5_log_drain_raw) ps5_log_drain_raw();
         char raw[200];
         int n = snprintf(raw, sizeof raw, "[host] ps5: fatal signal %d at %#lx (exe+%#lx) addr %p err %#lx rsp %#lx\n",
                          sig, (unsigned long)rip, (unsigned long)(in_module ? rip - (uintptr_t)at.dli_fbase : rip),
