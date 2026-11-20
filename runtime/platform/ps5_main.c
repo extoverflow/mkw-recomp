@@ -74,6 +74,48 @@ static int64_t dmem_free_total(unsigned *regions) {
     return n ? total - taken : -1;
 }
 
+// The GPU's new memory leaves the title this much direct memory free (MKW_PS5_DMEM_RESERVE_MIB, default 512): the
+// guest's pages, the runtime's heap and the system's own needs come from the same 12 GiB. Free roam, 19/11/2026:
+// the guest's memory grew to 5.7 GiB (races: 5.0-5.4), the GPU went on to its 4608 MiB cap, free direct memory fell to
+// 51 MiB, then "[ScePthread/System] Internal Memory is running out." and a RomFS read failed (exit 70 at ~18 min).
+// vk_device.c's allocator asks before each new block; refused, the block's caller trims textures as at the GPU cap.
+static int64_t dmem_reserve(void) {
+    static int64_t reserve = -1;
+    if (reserve < 0) {
+        const char *e = getenv("MKW_PS5_DMEM_RESERVE_MIB");
+        reserve = (int64_t)(e && *e ? atoll(e) : 512) << 20;
+    }
+    return reserve;
+}
+
+int ps5_gpu_alloc_ok(uint64_t bytes) {
+    static volatile int64_t n_refused;
+    int64_t reserve = dmem_reserve();
+    if (!reserve) return 1;
+    unsigned regions = 0;
+    int64_t free_all = dmem_free_total(&regions);
+    if (free_all < 0 || free_all - (int64_t)bytes >= reserve) return 1;
+    int64_t k = __atomic_add_fetch(&n_refused, 1, __ATOMIC_RELAXED);
+    if (k <= 8 || !(k & (k - 1)))
+        fprintf(stderr, "[host] ps5: GPU memory of %.1f MiB refused: %.1f MiB of direct memory free, %lld MiB kept free "
+                "(MKW_PS5_DMEM_RESERVE_MIB; %lld refused so far)\n", bytes / 1048576.0, free_all / 1048576.0,
+                (long long)(reserve >> 20), (long long)k);
+    return 0;
+}
+
+// Bytes the GPU should give back now (vk_backend.c asks every 30 frames): refusing new blocks stops its growth, but the
+// guest's memory goes on growing in free roam (the game filling its 2.4 GiB resource pool as it streams the world:
+// 5.27 -> 5.74 GiB in run 197, 19/11/2026) and took the free memory to 274 MiB with the GPU's blocks as they were.
+// Below the reserve plus 128 MiB, the shortfall plus 64 MiB; 0 when there is room (or the reserve is 0).
+uint64_t ps5_dmem_short(void) {
+    int64_t reserve = dmem_reserve();
+    if (!reserve) return 0;
+    unsigned regions = 0;
+    int64_t free_all = dmem_free_total(&regions), low = reserve + (128ll << 20);
+    if (free_all < 0 || free_all >= low) return 0;
+    return (uint64_t)(low - free_all) + (64ull << 20);
+}
+
 static void memory_report(const char *when) {
     struct ps5_heap_stats h = {0};
     ps5_heap_stats(&h);

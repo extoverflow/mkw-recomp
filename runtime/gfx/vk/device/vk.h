@@ -228,6 +228,7 @@ uint32_t vk_texture_reg_serial(void);
 extern uint32_t vk_tex_reg_limit;
 void vk_sampler_register(int id, const samp_par *s);                // sampler descriptor slot (copied)
 int  vk_texture_trim(uint64_t bytes);      // out of memory: released and idle mirrored textures go (vk_staging)
+void vk_mem_give_back(uint64_t bytes);     // the system short of memory (PS5): textures trimmed, finished frees collected
 void vk_texture_release(const tex_t *t);   // TextureFinalize: the image stays for slots that still name its storage
 void vk_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row, uint64_t img);
 void vk_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row, uint64_t img);
