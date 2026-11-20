@@ -138,8 +138,10 @@ __attribute__((weak)) int ps5_stack_report(char *out, size_t cap, int each);
 // A title asks the shell to close it (ps5_main.c); _exit would be reported as a crash. Weak: the payload tests have no
 // ps5_main.c and end with _exit as on Linux.
 __attribute__((weak)) void catchReturnFromMain(int status);
+__attribute__((weak)) void ps5_log_drain(void);   // ps5_main.c: the queued log lines first
 
 void plat_exit(int code) {
+    if (ps5_log_drain) ps5_log_drain();
     char rep[256];
     if (ps5_stack_report && ps5_stack_report(rep, sizeof rep, 0) > 0) fputs(rep, stderr);
     fflush(stdout);

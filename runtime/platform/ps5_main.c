@@ -6,6 +6,7 @@
 // main() is mkw_main (ps5_compat.h renames it).
 #undef main
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,9 +126,157 @@ static int log_open(void) {
     return ok;
 }
 
+// ---- the runtime's log lines written by a thread of their own. A write to mkw.log can block: each read of the file
+// through the web file manager blocked the title's appends ~0.7-0.95 s (runs 185-193, 19/11/2026), and every thread
+// that logged then stopped there, the replay thread too (the menus at 2-25 fps for minutes). rt_log_raw (main.c) puts
+// its lines in this queue instead and returns; "log writer" appends them. The queue drains before the title ends
+// (catchReturnFromMain, plat_exit) and, without locks, in the crash handler (ps5_mem.c). A full queue drops lines and
+// says how many. Lines written straight to stderr (this file's reports, RADV's) stay synchronous.
+#define LOGQ_SIZE (4u << 20)
+static char logq[LOGQ_SIZE];
+static volatile uint64_t logq_in, logq_out, logq_dropped;   // bytes queued, bytes written, bytes dropped (all time)
+static PlatMutex logq_lock = PLAT_MUTEX_INIT;
+static PlatCond logq_cond;
+static volatile int logq_on;
+static int logq_min;   // MKW_PS5_LOG=min: only the lines the frame-rate runs need (a baseline without logging's cost)
+
+// MKW_PS5_LOG=min keeps these and drops the rest (owner, 19/11/2026: a baseline with as little logging as can still be
+// measured): the minute's frame times, the game's phases (when a race starts), the run's settings, fatal errors,
+// the end, and the log writer's own stall lines.
+static int logq_keep(const char *p, size_t n) {
+    static const char *const keep[] = {"[host] frametime: 60 s", "[host] seq: enter", "[host] ps5: MKW_", "FATAL",
+                                       "[host] FATAL", "[host] exit status", "[host] ps5: log ", "[host] ps5: fatal"};
+    for (size_t i = 0; i < sizeof keep / sizeof *keep; i++) {
+        size_t k = strlen(keep[i]);
+        if (n >= k && !memcmp(p, keep[i], k)) return 1;
+    }
+    return 0;
+}
+
+int ps5_log_queue(const char *p, size_t n) {
+    if (!__atomic_load_n(&logq_on, __ATOMIC_ACQUIRE)) return 0;
+    if (logq_min && !logq_keep(p, n)) return 1;
+    plat_mutex_lock(&logq_lock);
+    if (logq_in - logq_out + n > LOGQ_SIZE) {
+        logq_dropped += n;
+    } else {
+        size_t at = (size_t)(logq_in % LOGQ_SIZE), first = n < LOGQ_SIZE - at ? n : LOGQ_SIZE - at;
+        memcpy(logq + at, p, first);
+        memcpy(logq, p + first, n - first);
+        logq_in += n;
+        plat_cond_signal(&logq_cond);
+    }
+    plat_mutex_unlock(&logq_lock);
+    return 1;
+}
+
+static void write_all(const char *p, size_t n) {
+    while (n) {
+        ssize_t w = write(ps5_log_fd, p, n);
+        if (w <= 0) return;
+        p += w, n -= (size_t)w;
+    }
+}
+
+static void logq_main(void *arg) {
+    (void)arg;
+    uint64_t told = 0;
+    plat_mutex_lock(&logq_lock);
+    for (;;) {
+        while (logq_in == logq_out) plat_cond_wait(&logq_cond, &logq_lock);
+        uint64_t from = logq_out;
+        size_t at = (size_t)(from % LOGQ_SIZE), n = (size_t)(logq_in - from);
+        if (n > LOGQ_SIZE - at) n = LOGQ_SIZE - at;   // up to the end of the ring; the rest next round
+        uint64_t dropped = logq_dropped;
+        plat_mutex_unlock(&logq_lock);
+        uint64_t t0 = plat_now_ns();
+        write_all(logq + at, n);   // the bytes stay put: writers only fill what logq_out has passed
+        uint64_t dt = plat_now_ns() - t0;
+        static uint64_t n_slow, slow_ns, worst_ns;
+        if (dt >= 100000000ull) {   // a write of 100 ms or more: the storage's stall, now off the game's threads
+            n_slow++, slow_ns += dt;
+            if (dt > worst_ns) worst_ns = dt;
+            if (n_slow <= 8 || !(n_slow & (n_slow - 1))) {
+                char line[160];
+                int k = snprintf(line, sizeof line, "[host] ps5: log write of %zu bytes took %.0f ms (%llu writes of 100 ms "
+                                 "or more, %.1f s in all, worst %.0f ms)\n", n, dt / 1e6, (unsigned long long)n_slow,
+                                 slow_ns / 1e9, worst_ns / 1e6);
+                if (k > 0) write_all(line, (size_t)k);
+            }
+        }
+        if (dropped != told) {
+            char line[128];
+            int k = snprintf(line, sizeof line, "[host] ps5: log queue full: %llu bytes of log lines dropped so far\n",
+                             (unsigned long long)dropped);
+            if (k > 0) write_all(line, (size_t)k);
+            told = dropped;
+        }
+        plat_mutex_lock(&logq_lock);
+        logq_out = from + n;
+    }
+}
+
+static void logq_start(void) {
+    const char *e = getenv("MKW_PS5_LOG_SYNC");   // 1: the old synchronous writes (comparisons)
+    if (e && *e == '1') return;
+    const char *m = getenv("MKW_PS5_LOG");
+    logq_min = m && !strcmp(m, "min");
+    plat_cond_init(&logq_cond);
+    if (plat_thread_spawn(logq_main, NULL, "log writer", 0)) __atomic_store_n(&logq_on, 1, __ATOMIC_RELEASE);
+}
+
+// Every fprintf to stderr in the title (ours and RADV's: "radv/ps5 submissions" every 10 s from the thread that
+// submits) goes through the queue too, so a blocked log write stops no thread that renders (link-title.sh
+// --wrap=fprintf). Other streams, and stderr before the writer starts or after the drain, as before.
+int __wrap_fprintf(FILE *f, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r;
+    if (f == stderr && __atomic_load_n(&logq_on, __ATOMIC_ACQUIRE)) {
+        char buf[2048];
+        r = vsnprintf(buf, sizeof buf, fmt, ap);
+        if (r > 0 && !ps5_log_queue(buf, (size_t)r < sizeof buf ? (size_t)r : sizeof buf - 1)) fputs(buf, f);
+    } else {
+        r = vfprintf(f, fmt, ap);
+    }
+    va_end(ap);
+    return r;
+}
+
+// What is queued, written before the title ends: waits up to 3 s for the writer, then writes the rest itself.
+void ps5_log_drain(void) {
+    if (!__atomic_load_n(&logq_on, __ATOMIC_ACQUIRE)) return;
+    for (int i = 0; i < 300 && __atomic_load_n(&logq_out, __ATOMIC_ACQUIRE) != __atomic_load_n(&logq_in, __ATOMIC_ACQUIRE); i++)
+        sceKernelUsleep(10000);
+    __atomic_store_n(&logq_on, 0, __ATOMIC_RELEASE);   // later lines straight to stderr
+    plat_mutex_lock(&logq_lock);
+    for (uint64_t at = logq_out; at < logq_in;) {
+        size_t i = (size_t)(at % LOGQ_SIZE), n = (size_t)(logq_in - at);
+        if (n > LOGQ_SIZE - i) n = LOGQ_SIZE - i;
+        write_all(logq + i, n);
+        at += n;
+    }
+    logq_out = logq_in;
+    plat_mutex_unlock(&logq_lock);
+}
+
+// The crash handler's: no lock (the crashed thread may hold it); lines the writer is writing may appear twice.
+void ps5_log_drain_raw(void) {
+    if (!__atomic_load_n(&logq_on, __ATOMIC_ACQUIRE)) return;
+    __atomic_store_n(&logq_on, 0, __ATOMIC_RELEASE);
+    uint64_t in = logq_in;
+    for (uint64_t at = logq_out; at < in;) {
+        size_t i = (size_t)(at % LOGQ_SIZE), n = (size_t)(in - at);
+        if (n > LOGQ_SIZE - i) n = LOGQ_SIZE - i;
+        write_all(logq + i, n);
+        at += n;
+    }
+}
+
 // Asks the shell to close the title and waits for it (the template's catchReturnFromMain). The C runtime calls it after
 // main returns; plat_exit (ps5_sys.c) calls it too.
 void catchReturnFromMain(int status) {
+    ps5_log_drain();
     memory_report("at exit");
     fprintf(stderr, "[host] exit status %d: asking the shell to close the title\n", status);
     fflush(NULL);
@@ -467,6 +616,7 @@ int main(int argc, char **argv) {
     (void)argc;
     ps5_dump_register("main");
     plat_thread_spawn(dump_watch, NULL, "dump watch", 0);
+    logq_start();
     plat_thread_spawn(mem_watch, NULL, "mem watch", 0);
     // The SDK's stdio.h expands getc/putc/putchar/fileno/feof inline on FreeBSD's FILE layout unless __isthreaded is
     // set, and the system libc's FILE is not that layout (title run: putchar wrote through a bad pointer). The payload
