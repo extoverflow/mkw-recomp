@@ -122,10 +122,12 @@ int plat_os_version(char *out, size_t cap) {
     return snprintf(out, cap, "PlayStation 5 (%s %s)", u.sysname, u.release) < (int)cap;
 }
 
-// No /proc/self/fd to name stderr's file by.
+// stderr is the title's log file (ps5_main.c log_open puts descriptors 1 and 2 on it). Said so, the runtime writes no
+// second copy of every line into <game dir>/logs/mkw.log (main.c log_open): that copy was written by each logging thread
+// itself, and a write to /data blocks up to ~0.95 s now and then, which stopped the replay thread at its log lines
+// (vk_astc_record's progress line, 94 of 103 stalls of 0.3-0.95 s in run 195, 19/11/2026).
 int plat_stderr_path(char *out, size_t cap) {
-    (void)out, (void)cap;
-    return 0;
+    return snprintf(out, cap, "%s", PS5_DATA_DIR "/mkw.log") < (int)cap;
 }
 
 // ---- process
