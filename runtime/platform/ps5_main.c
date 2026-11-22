@@ -138,7 +138,7 @@ static void memory_report(const char *when) {
             flex / 1048576.0, fr, dfree / 1048576.0, plat_process_uptime_ns() / 1e9, ftotal / 1048576.0, regions,
             (long long)(ps5_clock_drift_ns() / 1000), ru.ru_oublock, ru.ru_inblock,
             __atomic_load_n(&ps5_fs_bytes_written, __ATOMIC_RELAXED) / 1048576.0, log_size() / 1048576.0);
-    char st[900];
+    char st[1600];   // the PS5 memory layer's line (900 cut the vm_lock report, 2026-11-22)
     if (ps5_mem_stats(st, sizeof st) > 0) fprintf(stderr, "[host] ps5: memory %s: %s\n", when, st);
 }
 
@@ -255,6 +255,20 @@ static void logq_main(void *arg) {
         }
         plat_mutex_lock(&logq_lock);
         logq_out = from + n;
+    }
+}
+
+// The title's heartbeat: <data dir>/alive gets a new modification time every 2 s from a thread of its own (no data
+// written; a stalled write stops only this thread). Test tools read it before they press anything on the console: a
+// title that died between their checks was started again from the home screen by their next cross (2026-11-19, four
+// times). MKW_PS5_HEARTBEAT=0 turns it off.
+static void heartbeat_main(void *arg) {
+    (void)arg;
+    int fd = open(PS5_DIR "/alive", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    for (;;) {
+        (void)futimens(fd, NULL);
+        sceKernelUsleep(2000000);
     }
 }
 
@@ -456,14 +470,14 @@ static void mem_watch(void *arg) {
         plat_sleep_ms(10000);
         if (tick == 1) {   // args.txt reaches the environment after this thread starts (run 66: never on)
             const char *e = getenv("MKW_PS5_ALLOC_TRACE");
-            if (e && !strcmp(e, "1")) {
+            if (e && !strcmp(e, "1") && !ps5_alloc_trace_on) {
                 ps5_alloc_trace_on = 1;
                 fprintf(stderr, "[host] ps5: allocation trace on (MKW_PS5_ALLOC_TRACE): live sampled allocations by call site every 5 min\n");
             }
         }
         if (ps5_heap_trim) ps5_heap_trim();
         if (tick % 3 == 0) memory_report("every 30 s");
-        if (tick % 30 == 15 && ps5_alloc_trace_on) ps5_alloc_trace_report(stderr, 25);   // every 5 min (MKW_PS5_ALLOC_TRACE)
+        if ((tick == 3 || tick % 30 == 15) && ps5_alloc_trace_on) ps5_alloc_trace_report(stderr, 25);   // at 30 s, then every 5 min
         if (tick % 12 == 6) {   // every 2 min: how much of the guest's backed memory reads zero (todo.md, 2-hour goal)
             char z[320];
             ps5_mem_zero_census(z, sizeof z);
@@ -648,7 +662,7 @@ static int block_test(void) {
         p[page] = 7;                                 // re-backs that page alone
         printf("ps5-block-test: block %d page %llu: read %d (want 7)\n", b, (unsigned long long)(page / kp), p[page]);
     }
-    char st[900];
+    char st[1600];   // the PS5 memory layer's line (900 cut the vm_lock report, 2026-11-22)
     ps5_mem_stats(st, sizeof st);
     printf("ps5-block-test: %s\n", st);
     return 0;
@@ -659,6 +673,8 @@ int main(int argc, char **argv) {
     ps5_dump_register("main");
     plat_thread_spawn(dump_watch, NULL, "dump watch", 0);
     logq_start();
+    const char *hb = getenv("MKW_PS5_HEARTBEAT");
+    if (!(hb && *hb == '0')) plat_thread_spawn(heartbeat_main, NULL, "heartbeat", 0);
     plat_thread_spawn(mem_watch, NULL, "mem watch", 0);
     // The SDK's stdio.h expands getc/putc/putchar/fileno/feof inline on FreeBSD's FILE layout unless __isthreaded is
     // set, and the system libc's FILE is not that layout (title run: putchar wrote through a bad pointer). The payload
@@ -685,6 +701,9 @@ int main(int argc, char **argv) {
             *eq = 0;
             setenv(t, eq + 1, 1);
             fprintf(stderr, "[host] ps5: %s=%s\n", t, eq + 1);
+            // MKW_PS5_ALLOC_TRACE from here, before the boot allocates: started by mem_watch's first tick (10 s), the
+            // trace missed ~900 of the ~1,080 MiB in use (run 200, 20/11/2026: 937 MiB in use at 30 s)
+            if (!strcmp(t, "MKW_PS5_ALLOC_TRACE") && !strcmp(eq + 1, "1")) ps5_alloc_trace_on = 1;
             envs++;
         } else {
             args[n++] = t;
