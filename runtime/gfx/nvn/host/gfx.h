@@ -87,6 +87,7 @@ void gfx_shader_spirv_quiet(int on);
 void gfx_shader_spirv_keep(const GfxShader *s);
 uint64_t gfx_shader_spirv_release(void);
 void gfx_shader_spirv_release_wait(void);                   // until the release's thread has freed what it took
+uint64_t gfx_shader_spirv_pack(void);   // MKW_SPIRV_PACK: all SPIR-V kept compressed; no pointer to any may be in use
 // Reflection: parsed once per shader from its .res.json and the SPIR-V before it enters the cache.
 enum { GFX_RES_UBO, GFX_RES_SSBO, GFX_RES_TEX, GFX_RES_IMG, GFX_RES_KINDS };
 typedef struct {

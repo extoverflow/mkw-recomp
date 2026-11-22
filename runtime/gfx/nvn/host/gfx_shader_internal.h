@@ -12,6 +12,9 @@ struct GfxShader {
     uint32_t *spirv;                                       // read it through gfx_shader_spirv: it may be released
     uint64_t words;
     volatile int32_t spirv_state;                          // SPIRV_*: whether spirv may be released after the prewarm
+    void *zspirv;                                          // MKW_SPIRV_PACK: the SPIR-V zstd-compressed (a released
+    uint32_t zspirv_n;                                     // shader's comes back from here, not from its file)
+    uint8_t spirv_arena, zspirv_arena;                     // spirv / zspirv in gfx_shader.c's chunks, not malloc's
     char *reflection;                                      // the service's .res.json text, parsed into the fields below
     uint64_t reflection_size;
     // Reflection (reflect(), once per shader before it enters the cache)

@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <zstd.h>
 
 #include "cfg.h"
 #include "nvn_api.h"
@@ -39,7 +40,9 @@ GfxShader *gfx_shader_find(const uint8_t key[32]) {
 
 static void shader_free(GfxShader *s) {
     for (int k = 0; k < GFX_RES_KINDS; k++) free(s->res[k]);
-    free(s->spirv), free(s->reflection), free(s->spec), free(s);
+    if (!s->spirv_arena) free(s->spirv);
+    if (!s->zspirv_arena) free(s->zspirv);
+    free(s->reflection), free(s->spec), free(s);
 }
 
 
@@ -115,6 +118,55 @@ static void prepared_init(void *param) {
 static void prepared_paths(void) {
     static PlatOnce once = PLAT_ONCE_INIT;
     plat_once(&once, prepared_init, NULL);
+}
+
+// ---- MKW_SPIRV_PACK: the boot's SPIR-V in chunks of 32 MiB, the PS5 heap's mmap threshold (its platform library's
+// dlmalloc, DEFAULT_MMAP_THRESHOLD): a chunk is a mapping of its own and goes back to the system whole when freed. Read
+// file by file into the heap, the plain SPIR-V freed after packing stayed the title's, scattered among live blocks
+// (run 203: in use 1,076 -> 586-720 MiB, mapped 1,206-1,374 MiB). The packed copies get chunks of their own too.
+#define SPV_CHUNK (32u << 20)
+typedef struct { uint8_t **base; size_t *used; int n, cap; PlatMutex lock; int closed; } SpvArena;
+static SpvArena spv_raw = {.lock = PLAT_MUTEX_INIT}, spv_packed = {.lock = PLAT_MUTEX_INIT};
+static int spirv_pack_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("MKW_SPIRV_PACK");
+        on = e && *e == '1';
+    }
+    return on;
+}
+static void *arena_alloc(SpvArena *a, size_t n) {
+    if (!n || n > SPV_CHUNK / 4) return NULL;
+    size_t need = (n + 15) & ~(size_t)15;
+    void *p = NULL;
+    plat_mutex_lock(&a->lock);
+    if (!a->closed) {
+        if (!a->n || a->used[a->n - 1] + need > SPV_CHUNK) {
+            if (a->n == a->cap) {
+                int cap = a->cap ? 2 * a->cap : 32;
+                uint8_t **nb = realloc(a->base, sizeof *nb * (size_t)cap);
+                size_t *nu = nb ? realloc(a->used, sizeof *nu * (size_t)cap) : NULL;
+                if (nb) a->base = nb;
+                if (nu) a->used = nu, a->cap = cap;
+            }
+            uint8_t *c = a->n < a->cap ? malloc(SPV_CHUNK) : NULL;
+            if (c) a->base[a->n] = c, a->used[a->n] = 0, a->n++;
+        }
+        if (a->n && a->used[a->n - 1] + need <= SPV_CHUNK) {
+            p = a->base[a->n - 1] + a->used[a->n - 1];
+            a->used[a->n - 1] += need;
+        }
+    }
+    plat_mutex_unlock(&a->lock);
+    return p;
+}
+// Every chunk freed and the arena closed (later allocations go to malloc). Nothing may point into it.
+static void arena_release(SpvArena *a) {
+    plat_mutex_lock(&a->lock);
+    for (int i = 0; i < a->n; i++) free(a->base[i]);
+    free(a->base), free(a->used);
+    a->base = NULL, a->used = NULL, a->n = a->cap = 0, a->closed = 1;
+    plat_mutex_unlock(&a->lock);
 }
 
 // A program's prepared file of kind 0 .spv, 1 .res.json, 2 .cs.spv: from spirv/shaders.pack, else <key><suffix>.
@@ -218,6 +270,10 @@ static GfxShader *prepared_load(const uint8_t key[32], const uint8_t *control) {
     memcpy(s->iid, key, 32);   // pipeline key records name a prepared shader by its program key (gfx_shader_load_input)
     s->spirv = (uint32_t *)spv;
     s->words = spv_size / 4;
+    if (spirv_pack_on()) {   // into the boot's chunks, released whole once every shader's is packed
+        void *a = arena_alloc(&spv_raw, spv_size);
+        if (a) memcpy(a, spv, spv_size), free(spv), s->spirv = a, s->spirv_arena = 1;
+    }
     s->reflection = (char *)res;
     s->reflection_size = res_size;
     if (control) {
@@ -369,15 +425,24 @@ void gfx_shader_spirv_quiet(int on) { spirv_quiet = on; }
 
 void gfx_shader_spirv_keep(const GfxShader *s) { plat_cas32(&((GfxShader *)s)->spirv_state, SPIRV_KEPT, SPIRV_PREPARED); }
 
-// The file is read outside spirv_lock, which a read back then holds only to put the bytes in place: a drawing thread's
-// does not wait for the workers' preads.
+// The bytes are made outside spirv_lock, which a read back then holds only to put them in place: a drawing thread's
+// does not wait for the workers' preads. A packed program (gfx_shader_spirv_pack) is unpacked from memory, ~0.1 ms,
+// where a read of its file on the console's /data stalled the replay thread up to 1.4 s (PS5, 19/11/2026).
 static void spirv_reload(GfxShader *s) {
     uint64_t n = 0;
-    uint8_t *spv = prepared_spv(s->key, &n, 0);
+    uint8_t *spv;
     char hex[65];
     gfx_shader_key_hex(s->key, hex);
-    if (!spv || n != s->words * 4)
-        rt_fatal("gfx_shader: %s/%s.spv changed or went missing since it was loaded", prepared_dir, hex);
+    if (s->zspirv) {
+        n = s->words * 4;
+        spv = malloc(n);
+        if (!spv || ZSTD_decompress(spv, n, s->zspirv, s->zspirv_n) != n)
+            rt_fatal("gfx_shader: packed SPIR-V of %llu words could not be unpacked", (unsigned long long)s->words);
+    } else {
+        spv = prepared_spv(s->key, &n, 0);
+        if (!spv || n != s->words * 4)
+            rt_fatal("gfx_shader: %s/%s.spv changed or went missing since it was loaded", prepared_dir, hex);
+    }
     plat_mutex_lock(&spirv_lock);
     int ours = __atomic_load_n(&s->spirv_state, __ATOMIC_ACQUIRE) == SPIRV_RELEASED;
     if (ours) {
@@ -474,7 +539,8 @@ uint64_t gfx_shader_spirv_release(void) {
     plat_mutex_lock_shared(&cache_lock);
     for (int b = 0; b < BUCKETS; b++)
         for (GfxShader *s = buckets[b]; s && r->n < cap; s = s->next)
-            if (plat_cas32(&s->spirv_state, SPIRV_RELEASED, SPIRV_PREPARED) == SPIRV_PREPARED) {
+            // SPIR-V in the boot's chunks (MKW_SPIRV_PACK) is not the C heap's: gfx_shader_spirv_pack frees it whole
+            if (!s->spirv_arena && plat_cas32(&s->spirv_state, SPIRV_RELEASED, SPIRV_PREPARED) == SPIRV_PREPARED) {
                 r->bytes += s->words * 4;
                 r->p[r->n++] = s->spirv;
                 s->spirv = NULL;
@@ -486,6 +552,83 @@ uint64_t gfx_shader_spirv_release(void) {
     release_thread = 1;
     if (!plat_thread_spawn(release_main, r, "spirv free", 0)) release_thread = 0, release_free(r);   // r: the thread's
     return bytes;
+}
+
+// MKW_SPIRV_PACK=1 (the PS5 profile): after the records' prewarm, every shader's SPIR-V is kept zstd-compressed and the
+// plain copy freed; a read decompresses it (spirv_reload). On the PS5 the records' prewarm reads every shader's (~5,100,
+// 541 MiB: half the runtime's heap, run 201's allocation trace, 20/11/2026), in the title's 12 GiB beside the guest's
+// 5.7 GiB in free roam; freed and read back from its file instead, the replay thread stalled on /data (run 202). Only
+// when nothing can hold a pointer to a shader's SPIR-V: the prewarm finished, no draw made yet (vk_pipe_keys.c).
+typedef struct { GfxShader **s; int n; volatile int32_t next; uint64_t in, out; } PackJob;
+static void pack_worker(void *arg) {
+    PackJob *j = arg;
+    uint64_t in = 0, out = 0;
+    for (int i; (i = plat_inc32(&j->next) - 1) < j->n;) {
+        GfxShader *s = j->s[i];
+        size_t raw = s->words * 4, cap = ZSTD_compressBound(raw);
+        uint8_t *z = malloc(cap);
+        size_t zn = z ? ZSTD_compress(z, cap, s->spirv, raw, 3) : 0;
+        if (!z || ZSTD_isError(zn)) { free(z); continue; }
+        void *in_arena = arena_alloc(&spv_packed, zn);
+        if (in_arena) {
+            memcpy(in_arena, z, zn), free(z);
+            s->zspirv = in_arena, s->zspirv_arena = 1;
+        } else {
+            void *fit = realloc(z, zn);
+            s->zspirv = fit ? fit : z;
+        }
+        s->zspirv_n = (uint32_t)zn;
+        in += raw, out += zn;
+    }
+    plat_add64((volatile int64_t *)&j->in, (int64_t)in), plat_add64((volatile int64_t *)&j->out, (int64_t)out);
+}
+
+uint64_t gfx_shader_spirv_pack(void) {
+    double t0 = (double)plat_now_ns();
+    PackJob j = {0};
+    plat_mutex_lock(&spirv_lock);
+    plat_mutex_lock_shared(&cache_lock);
+    int cap = 0;
+    for (int b = 0; b < BUCKETS; b++)
+        for (GfxShader *s = buckets[b]; s; s = s->next) cap++;
+    j.s = malloc(sizeof *j.s * (size_t)(cap ? cap : 1));
+    for (int b = 0; j.s && b < BUCKETS; b++)
+        for (GfxShader *s = buckets[b]; s; s = s->next) {
+            int32_t st = __atomic_load_n(&s->spirv_state, __ATOMIC_ACQUIRE);
+            if ((st == SPIRV_KEPT || st == SPIRV_PREPARED) && s->spirv && !s->zspirv && s->words) j.s[j.n++] = s;
+        }
+    PlatThread *t[8];
+    int nt = 0;
+    for (int i = 0; i < 8 && i < (int)plat_cpu_count() - 1 && j.n > 64; i++)
+        if ((t[nt] = plat_thread_new(pack_worker, &j, "spirv pack"))) nt++;
+    pack_worker(&j);
+    for (int i = 0; i < nt; i++) plat_thread_join(t[i]);
+    for (int i = 0; i < j.n; i++)
+        if (j.s[i]->zspirv) {
+            __atomic_store_n(&j.s[i]->spirv_state, SPIRV_RELEASED, __ATOMIC_RELEASE);
+            if (!j.s[i]->spirv_arena) free(j.s[i]->spirv);
+            j.s[i]->spirv = NULL, j.s[i]->spirv_arena = 0;
+        }
+    // what still points into the boot's chunks (not packed: a compression that failed, a state not taken) moves to
+    // malloc, then every chunk goes back whole
+    for (int b = 0; b < BUCKETS; b++)
+        for (GfxShader *s = buckets[b]; s; s = s->next)
+            if (s->spirv_arena && s->spirv) {
+                void *m = malloc(s->words * 4);
+                if (!m) rt_fatal("gfx_shader: out of memory");
+                memcpy(m, s->spirv, s->words * 4);
+                s->spirv = m, s->spirv_arena = 0;
+            }
+    int chunks = spv_raw.n;
+    arena_release(&spv_raw);
+    plat_mutex_unlock_shared(&cache_lock);
+    plat_mutex_unlock(&spirv_lock);
+    free(j.s);
+    plat_heap_trim();
+    rt_log("gfx_shader: SPIR-V of %d shaders packed: %.0f -> %.0f MiB in memory (MKW_SPIRV_PACK), %.0f ms; %d chunks "
+           "of 32 MiB given back, %d holding the packed copies", j.n, (double)j.in / (1 << 20), (double)j.out / (1 << 20),
+           ((double)plat_now_ns() - t0) / 1e6, chunks, spv_packed.n);
+    return j.in > j.out ? j.in - j.out : 0;
 }
 
 int gfx_shader_stage(const GfxShader *s) { return s->stage; }
@@ -540,6 +683,8 @@ const GfxShader *gfx_shader_variant(const GfxShader *s, const uint32_t *val, con
     // variant is made. Do not read that atomic memo through a whole-struct copy.
     memcpy(v, s, offsetof(GfxShader, spirv_fnv));
     v->next = NULL, v->spirv = w, v->spirv_state = SPIRV_KEPT, v->variant_of = s, v->spirv_fnv = 0;   // its own SPIR-V
+    v->zspirv = NULL, v->zspirv_n = 0;   // the base's packed copy stays the base's (its own SPIR-V is w)
+    v->spirv_arena = v->zspirv_arena = 0;
     size_t n = 32 + (size_t)s->nspec * 5;
     uint8_t *buf = malloc(n);
     if (!buf) rt_fatal("gfx_shader: out of memory");

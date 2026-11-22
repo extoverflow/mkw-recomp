@@ -814,6 +814,10 @@ static void prewarm_run(void) {
             if (sh[j]) gfx_shader_spirv_keep(sh[j]);
     free(ids), free(sh);
     plat_file_delete(mark);   // the boot got through: a stall above left the rest to the background, not a crash
+    // MKW_SPIRV_PACK=1 (the PS5 profile): every shader's SPIR-V kept compressed from here (gfx_shader.c). Not after a
+    // stall: builds go on in the background and may hold a pointer to it.
+    const char *pk = cfg_get("MKW_SPIRV_PACK");
+    if (!stalled && pk && *pk == '1') gfx_shader_spirv_pack();
 }
 
 // The release after both prewarms: the records' builds read quietly too, so their shaders' SPIR-V goes as well. The

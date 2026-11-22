@@ -350,6 +350,7 @@ static const CfgRow rows[] = {
     K("SPARSE_NO_BUFFER"),
     K("SPIN"),
     K("SPIN_HANDOFF_US"),
+    K("SPIRV_PACK"),
     K("STEAM_X11"),
     K("SWKBD_ANSWER"),
     K("SWKBD_TEST"),
@@ -567,6 +568,9 @@ static const struct { const char *key, *value; } PS5[] = {
     // A texture whose pages were written is uploaded again only when its bytes changed (vk_tex_upload.c): run 185 spent
     // 491 s of its first 19 min uploading 55,546 textures again with the same bytes.
     {"TEX_HASH_WRITTEN", "1"},
+    // Every shader's SPIR-V kept zstd-compressed after the records' prewarm (gfx_shader.c gfx_shader_spirv_pack):
+    // 541 MiB of the runtime's heap otherwise (run 201's allocation trace).
+    {"SPIRV_PACK", "1"},
     // A race frame recorded on 6 threads in chunks of 160 draws (the first 32): the game finishes submitting a frame
     // in ~11 ms and one replay thread then needed ~15 ms of CPU, so the frame ended ~19 ms after it began (run 99,
     // MKW_TRACE_TL). Run 103 (30 min of Grand Prix): recording ends 1.5 ms after the game's last submit, a frame every
