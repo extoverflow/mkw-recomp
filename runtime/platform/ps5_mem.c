@@ -973,6 +973,10 @@ int ps5_mem_zero_census(char *out, size_t cap) {
                 c->zseen[i / 8] |= bit;
             }
             plat_mutex_unlock(&vm_lock);
+            // A pause between blocks, so the threads waiting for vm_lock get it: taken again at once, block after
+            // block, the census (64-739 ms every 2 min) kept the replay thread's write-watch queries waiting 15-50 ms
+            // in a frame (runs 209a/209b, 2026-11-23: one such frame every 7,200 frames in free roam).
+            plat_wait_ns(200000);   // a plain sleep: no spinning
         }
     }
     st_zero_given += given;
