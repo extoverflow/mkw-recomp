@@ -12,6 +12,7 @@
 #include "switch2.h"
 #include "cfg.h"
 #include "launcher.h"
+#include "ui/launcher/libs_fetch.h"
 
 // ---- keyboard and mouse (input_wsys.h; input_sdl.c on Linux): none on a console. input.c is built, on
 // platform/ps5_sdl.c's gamepads.
@@ -54,6 +55,14 @@ int switch2_battery(uint32_t sdl_id, int *mv) {
 // come from scePad (platform/ps5_sdl.c), and no wheel is opened there
 void input_wheel_hint(void) {}
 void input_wheel_map(void) {}
+
+// ---- optional libraries (ui/launcher/libs_fetch.cpp, upstream 96d9eda: DLSS, FSR 3.1 downloaded by libs.py): none on
+// the PS5, whose RADV has neither; the menu sees no fetch running and none finished
+LibsState libs_state(void) {
+    LibsState s = {0};
+    return s;
+}
+void libs_fetch_start(const char *features) { (void)features; }
 
 // ---- --probe-pads (probes/pads_probe.c, upstream 96d9eda): it attaches virtual SDL gamepads, which the PS5 SDL subset
 // does not have (its pads are scePad's)

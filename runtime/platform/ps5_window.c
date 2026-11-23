@@ -160,3 +160,7 @@ int gfx_window_lines(void) {
     int w, h;
     return gfx_window_shape(&w, &h) ? h : 0;
 }
+
+// Why no window can open (vk.h; gfx_window_sdl.c keeps SDL's reason): the PS5's display plane surface is made at
+// vk_init and logs its own failure (vkCreateDisplayPlaneSurfaceKHR above), so there is no earlier reason to give.
+const char *gfx_window_failed(void) { return NULL; }

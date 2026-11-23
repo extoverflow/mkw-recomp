@@ -1050,3 +1050,14 @@ int ps5_mem_stats(char *out, size_t cap) {
                     st_ww_ns / 1e9, (unsigned long long)st_hot_made, (unsigned long long)st_hot_aged, (unsigned long long)st_gpu_shared, (unsigned long long)st_gpu_backed, (unsigned long long)st_gpu_kept,
                     (unsigned long long)st_gpu_unshared, (unsigned long long)st_gpu_released);
 }
+
+// ---- upstream 96d9eda's memory calls the PS5 answers as Windows does (win32_mem.c:48-53, win32_load.c:270-271):
+// memory_spill.c's page drop and the udmabuf zero-copy pools (vk_mem_zc.c) are Linux's; no smaps labels, no mincore.
+int plat_mem_drop(uint64_t addr, uint64_t n) { return (void)addr, (void)n, 0; }
+void plat_mem_name(const void *p, size_t n, const char *name) { (void)p, (void)n, (void)name; }
+int64_t plat_mem_resident(const void *p, size_t n) { return (void)p, (void)n, -1; }
+int plat_shared_open(uint64_t size, PlatShared *s, const char **why) { return (void)size, (void)s, *why = "not on the PS5", 0; }
+void plat_shared_close(PlatShared *s) { (void)s; }
+int plat_mem_share(uint64_t addr, uint64_t n, const PlatShared *s, uint64_t off) { return (void)addr, (void)n, (void)s, (void)off, 0; }
+uint8_t *plat_mem_shared_at(uint64_t addr) { return (void)addr, NULL; }
+int plat_shadow_stack(unsigned *flags) { return (void)flags, -1; }   // as linux_mem.c:415: no such policy to read

@@ -297,6 +297,11 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb) {
 
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) { *resident = *private_bytes = 0; }
 
+// Upstream 96d9eda's platform calls the PS5 answers as Windows does (win32_sys.c, win32_load.c): no scratch file for
+// memory_spill.c (pages out of RAM: Linux only), and no per-process VRAM count (linux_sys.c:449 returns 0 too).
+PlatFile *plat_file_scratch(const char *dir) { return (void)dir, NULL; }
+uint64_t plat_gpu_process_vram_mib(void) { return 0; }
+
 // linux_sys.c:556 (upstream 3042c59) is malloc_trim(0) after a large release of small blocks. The PS5's heap is the SDK
 // fork's platform heap, whose ps5_heap_trim gives back each arena's free top and empty segments (ps5_main.c mem_watch
 // calls it every 10 s too); weak: an older SDK has none.

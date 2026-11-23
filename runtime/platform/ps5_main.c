@@ -139,6 +139,15 @@ uint64_t ps5_dmem_short(void) {
     return (uint64_t)(low - free_all) + (64ull << 20);
 }
 
+// The C heap (platform.h, upstream 96d9eda; linux_sys.c reads mallinfo2): the SDK heap's own counts, free being what
+// its segments map beyond what is in use.
+void plat_heap_stats(uint64_t *in_use, uint64_t *free_bytes, uint64_t *mapped) {
+    struct ps5_heap_stats h = {0};
+    ps5_heap_stats(&h);
+    *in_use = h.in_use_bytes, *mapped = h.mapped_bytes;
+    *free_bytes = h.mapped_bytes > h.in_use_bytes ? h.mapped_bytes - h.in_use_bytes : 0;
+}
+
 static void memory_report(const char *when) {
     struct ps5_heap_stats h = {0};
     ps5_heap_stats(&h);
