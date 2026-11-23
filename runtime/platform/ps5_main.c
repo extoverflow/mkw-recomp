@@ -88,13 +88,36 @@ static int64_t dmem_reserve(void) {
     return reserve;
 }
 
+// dmem_free_total for the GPU's checks, taken again at most every 200 ms and lowered by what they let through in
+// between: the walk is a system call per allocated region (~240), 2-5 ms, and VMA asks before every new block, so a
+// race frame making 112 blocks spent ~440 ms in it on the replay thread (run 209i, 23/11/2026: image creation 2-4 ms
+// per block, the GPU allocation itself ~0.1 ms). What the guest takes within 200 ms is covered by the reserve.
+// Returns the free memory the check saw (-1: unknown); when that leaves the reserve after bytes, the bytes are taken
+// from the figure under the same lock, so two threads cannot both pass on one figure. Refused: walked again next time.
+static PlatMutex free_lock = PLAT_MUTEX_INIT;
+static int64_t free_cached = -1;
+static uint64_t free_at;
+static int64_t dmem_free_take(int64_t bytes, int64_t reserve, int *ok) {
+    plat_mutex_lock(&free_lock);
+    uint64_t now = plat_now_ns();
+    if (free_cached < 0 || now - free_at > 200000000ull) {
+        unsigned regions = 0;
+        free_cached = dmem_free_total(&regions), free_at = now;
+    }
+    int64_t f = free_cached;
+    *ok = f < 0 || f - bytes >= reserve;
+    if (f >= 0) free_cached = *ok ? f - bytes : -1;
+    plat_mutex_unlock(&free_lock);
+    return f;
+}
+
 int ps5_gpu_alloc_ok(uint64_t bytes) {
     static volatile int64_t n_refused;
     int64_t reserve = dmem_reserve();
     if (!reserve) return 1;
-    unsigned regions = 0;
-    int64_t free_all = dmem_free_total(&regions);
-    if (free_all < 0 || free_all - (int64_t)bytes >= reserve) return 1;
+    int ok;
+    int64_t free_all = dmem_free_take((int64_t)bytes, reserve, &ok);
+    if (ok) return 1;
     int64_t k = __atomic_add_fetch(&n_refused, 1, __ATOMIC_RELAXED);
     if (k <= 8 || !(k & (k - 1)))
         fprintf(stderr, "[host] ps5: GPU memory of %.1f MiB refused: %.1f MiB of direct memory free, %lld MiB kept free "
