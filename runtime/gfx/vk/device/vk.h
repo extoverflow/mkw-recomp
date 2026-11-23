@@ -459,9 +459,13 @@ void vk_astc_release(void);             // vk_device.c, before the device goes: 
 typedef struct { uint32_t w, h, slices, level, layer; } VkTexpreRegion;   // one region of an upload, in upload order
 int vk_texpre_on(void);
 uint64_t vk_texpre_hash(const void *p, uint64_t n);
-uint64_t vk_texpre_region_bytes(const VkTexpreRegion *r);   // BC7 bytes of a region
-int vk_texpre_has(uint64_t h);          // 1: the directory held BC7 for h when it was listed
-int vk_texpre_load(uint64_t h, void *dst, uint64_t size);   // 1: dst holds the size bytes of BC7 stored for h
+uint64_t vk_texpre_region_bytes(const VkTexpreRegion *r, int bc1);   // BC7 (BC1: bc1 1) bytes of a region
+int vk_texpre_has(uint64_t h, int bc1); // 1: the directory held BC7 (bc1: BC1) for h when it was listed
+int vk_astc_storage_bc1(const uint8_t *p, uint64_t size, int bw, int bh);   // vk_tex_image.c: ASTC storage that becomes BC1
+typedef struct VkTexpreFile VkTexpreFile;
+VkTexpreFile *vk_texpre_open(uint64_t h, int bc1, uint64_t size);   // the BC7 (BC1) stored for h; NULL: none or wrong size
+int vk_texpre_read(VkTexpreFile *t, uint64_t at, void *dst, uint64_t n);    // 1: dst holds its bytes [at, at + n)
+int vk_texpre_close(VkTexpreFile *t);   // frees it; 1 when every read succeeded
 void vk_texpre_record(uint64_t h, const nvn_texdesc *d, const VkTexpreRegion *rg, int n, const void *mem, uint64_t size);
 void vk_mem_note_submit(uint64_t part_value);      // vk_sync.c: after each submit, the part value it signals
 void vk_mem_recording(uint64_t fence);             // this thread records submission fence (0: done): what it destroys

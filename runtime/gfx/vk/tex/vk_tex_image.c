@@ -388,6 +388,12 @@ static int astc_alpha_one(const uint8_t *p, uint64_t size, int bw, int bh) {
     return !J.stop && J.any;
 }
 
+// The storage's part of the BC1 choice below (no alpha in any block, or alpha 1 decoded in every texel): also the
+// offline encoder's (vk_texpre.c), which must pick what this file picks for the same bytes.
+int vk_astc_storage_bc1(const uint8_t *p, uint64_t size, int bw, int bh) {
+    return astc_opaque(p, size) || astc_alpha_one(p, size, bw, bh);
+}
+
 // Texture memory made before play (MKW_VK_TEX_POOL_MIN=<blocks>, default half the VRAM up to 8, 0 off; by default on
 // discrete GPUs only, a value set makes it on any): a pool of fixed 256 MiB blocks, that many of them allocated at
 // start on a thread of their own, takes the textures of its memory type.

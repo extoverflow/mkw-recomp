@@ -105,9 +105,10 @@ static uint32_t up_group(VkBufferImageCopy *rg, uint32_t g0, uint32_t n, VkDevic
     return g1;
 }
 
-// An ASTC texture re-encoded as BC7: the BC7 encoded offline for these storage bytes (vk_texpre.c) straight into the
-// image. Without one, the storage is recorded for the offline encoder and 0 sends the upload on through the GPU encoder.
-static int upload_texpre(Tex *e, uint32_t levels, uint32_t layers) {
+// An ASTC texture re-encoded as BC7 (bc1: BC1): the blocks encoded offline for these storage bytes (vk_texpre.c)
+// straight into the image. Without them, the storage is recorded for the offline encoder and 0 sends the upload on
+// through the GPU encoder.
+static int upload_texpre(Tex *e, uint32_t levels, uint32_t layers, int bc1) {
     const tex_t *t = &e->t;
     const nvn_texdesc *d = &t->d;
     int is3d = d->target == NVN_TEXTURE_TARGET_3D, one_d = e->pub.type == VK_IMAGE_TYPE_1D;
@@ -121,21 +122,26 @@ static int upload_texpre(Tex *e, uint32_t levels, uint32_t layers) {
             pr[k] = (VkTexpreRegion){w, h, sl, lv, ly};
             rg[k] = (VkBufferImageCopy){.bufferOffset = total, .imageSubresource = {e->pub.aspect, lv, ly, 1},
                                         .imageExtent = {w, h, sl}};
-            total += vk_texpre_region_bytes(&pr[k]);
+            total += vk_texpre_region_bytes(&pr[k], bc1);
         }
     uint64_t h = vk_texpre_hash(t->mem, t->L.size);
     int ok = 0;
-    if (vk_texpre_has(h)) {   // over UP_CHUNK, decoded into memory first and staged in groups
-        uint8_t *bc = total > UP_CHUNK ? malloc(total) : NULL;
-        ok = total > UP_CHUNK ? bc && vk_texpre_load(h, bc, total) : 1;
-        VkDeviceSize done = 0, gtotal;
-        for (uint32_t g0 = 0, g1; ok && g0 < n; g0 = g1, done += gtotal) {
-            g1 = up_group(rg, g0, n, total, !bc, &gtotal);
+    VkTexpreFile *f = vk_texpre_open(h, bc1, total);
+    if (f) {
+        // In upstream's groups (up_group: UP_CHUNK, flushed past UP_FLUSH), each group's bytes decoded straight from
+        // the file (vk_texpre_read: its frames found once), so no copy of the whole texture is made first: the 8188x7292
+        // map texture's 121 MB at once failed on the PS5 (19/11/2026). A group that fails to load leaves the earlier
+        // ones copied: the GPU path then uploads the whole texture again.
+        ok = 1;
+        VkDeviceSize gtotal;
+        for (uint32_t g0 = 0, g1; ok && g0 < n; g0 = g1) {
+            VkDeviceSize base = rg[g0].bufferOffset;   // (up_group makes the group's offsets relative to it)
+            g1 = up_group(rg, g0, n, total, 0, &gtotal);
             if (g0) vk_upload_flush_over(UP_FLUSH);
             VkBuffer sb;
             uint8_t *stg;
             VkCommandBuffer cb = vk_upload_begin_staging(gtotal, &sb, (void **)&stg);
-            ok = stg && (bc ? (memcpy(stg, bc + done, gtotal), 1) : vk_texpre_load(h, stg, total));
+            ok = stg && vk_texpre_read(f, base, stg, gtotal);
             if (ok) {
                 barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
                 vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, g1 - g0, rg + g0);
@@ -143,7 +149,7 @@ static int upload_texpre(Tex *e, uint32_t levels, uint32_t layers) {
             }
             vk_upload_end();
         }
-        free(bc);
+        ok = vk_texpre_close(f) && ok;
     }
     if (!ok) vk_texpre_record(h, d, pr, (int)n, t->mem, t->L.size);
     free(pr), free(rg);
@@ -259,7 +265,8 @@ static void upload_(Tex *e) {
         acheck = agpu && vk_astc_mode() == VK_ASTC_CHECK && (uint64_t)e->pub.width * e->pub.height * e->pub.layers * 4 <= (16ull << 20);
     uint32_t n = levels * layers, k = 0;
     uint32_t drop = e->pub.drop;   // NVN level = image level + drop
-    if (agpu && e->f.astc_bc7 == 1 && !acheck && !linear && !drop && vk_texpre_on() && upload_texpre(e, levels, layers))
+    if (agpu && e->f.astc_bc7 && !acheck && !linear && !drop && vk_texpre_on() &&
+        upload_texpre(e, levels, layers, e->f.astc_bc7 == 2))
         goto counted;
     VkBufferImageCopy *rg = calloc(n, sizeof *rg);
     VkAstcRegion *ar = agpu ? calloc(n, sizeof *ar) : NULL;
