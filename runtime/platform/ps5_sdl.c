@@ -39,6 +39,7 @@ static bool fail(const char *what) {
 const char *SDL_GetError(void) { return g_error; }
 void SDL_free(void *mem) { free(mem); }
 void SDL_SetEventEnabled(Uint32 type, bool enabled) { (void)type, (void)enabled; }   // no event queue here
+bool SDL_PushEvent(SDL_Event *event) { (void)event; return false; }   // dropped: nothing waits for events here
 
 // ---- gamepads
 struct pad_sample {   // one reading as scePadRead returns it

@@ -34,10 +34,27 @@ void SDL_free(void *mem);
 // An interface struct's version is its size (SDL_stdinc.h SDL_INIT_INTERFACE).
 #define SDL_INIT_INTERFACE(iface) (memset((iface), 0, sizeof(*(iface))), (iface)->version = (Uint32)sizeof(*(iface)))
 
-// ---- SDL_events.h: only switching an event type off
+// ---- SDL_events.h: switching an event type off, and a user event pushed to wake a loop that waits for input
+// (plugin/mod_page_ui.cpp, upstream 96d9eda). The console has no event loop (its menus draw every frame): SDL_PushEvent
+// drops the event and returns false, as SDL3 does for one a filter drops.
 typedef Uint32 SDL_EventType;
 #define SDL_EVENT_GAMEPAD_SENSOR_UPDATE 0x659u
+#define SDL_EVENT_USER 0x8000u
 void SDL_SetEventEnabled(Uint32 type, bool enabled);
+typedef struct SDL_UserEvent {
+    Uint32 type, reserved;
+    Uint64 timestamp;
+    Uint32 windowID;
+    Sint32 code;
+    void *data1, *data2;
+} SDL_UserEvent;
+typedef union SDL_Event {
+    Uint32 type;
+    SDL_UserEvent user;
+    Uint8 padding[128];
+} SDL_Event;
+bool SDL_PushEvent(SDL_Event *event);
+#define SDL_zero(x) memset(&(x), 0, sizeof(x))
 
 // ---- SDL_properties.h
 typedef Uint32 SDL_PropertiesID;
