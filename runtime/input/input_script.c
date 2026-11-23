@@ -131,7 +131,25 @@ static const char *const quick_gp[] = {
 // only, and a held A never leaves the race results (mem6b, 24/11/2026: the cup sat on the first race's results until A was pressed by ctl).
 static const char *const quick_free[] = {"TitleWait+40 A 6", "TitleMenuMain+60 PLUS 6"};
 
+#define QUICK_GP_EVERY 90                 // ticks: press-race.txt's spacing, slower than any menu's transition
+#define QUICK_GP_TICKS (60 * 60 * 25)     // 25 min of game time: four races, their results and the cup's end
+
 static void script_load_quick(const char *mode) {
+    // MKW_BENCH=gp (core/diag/bench.c): A every QUICK_GP_EVERY ticks from the title on, through the menus (every
+    // default choice), the races (A accelerates) and the results. From mkw-pit-stop input_script.c:126-141 @ 0a0259d.
+    // Test builds only (MKW_WITH_BENCH, core/diag/bench.h).
+#ifdef MKW_WITH_BENCH
+    if (!strcmp(mode, "gp") && !strcmp(cfg_value("MKW_BENCH"), "gp")) {
+        for (int t = 40; t < QUICK_GP_TICKS; t += QUICK_GP_EVERY) {
+            char line[64];
+            ScriptEv e;
+            snprintf(line, sizeof line, "TitleWait+%d A 10", t);
+            if (script_parse(line, 0, &e) > 0) script_add(&e);
+        }
+        rt_log("input: MKW_BENCH=gp, A every %d ticks from TitleWait (%d presses)", QUICK_GP_EVERY, script_n);
+        return;
+    }
+#endif
     int free_roam = !strcmp(mode, "free"), gp = !strcmp(mode, "gp");
     const char *const *lines = free_roam ? quick_free : gp ? quick_gp : quick_tt;
     int n = free_roam ? (int)(sizeof quick_free / sizeof *quick_free)

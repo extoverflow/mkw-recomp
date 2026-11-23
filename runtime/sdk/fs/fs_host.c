@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bench.h"
 #include "cfg.h"
 #include "fs.h"
 #include "hacks.h"
@@ -885,26 +886,36 @@ static int64_t host_read_at(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
 
 // MKW_UNLOCK_ALL (core/hacks/unlock.c): Play/account.sav's working copy edited once a session, before the game's first
 // read of it; the committed save changes only when the game saves.
+// MKW_UNLOCK_ALL and MKW_BENCH's assists (core/diag/bench.c, from mkw-pit-stop fs_host.c:886-906 @ 0a0259d): the
+// working copy of Play/account.sav edited once a session, before the game's first read of it.
 static void unlock_on_open(const char *host_path, int kind) {
     static int done;
     size_t n = strlen(host_path);
-    if (done || n < 16 || strcmp(host_path + n - 16, "Play/account.sav") || !cfg_bool("MKW_UNLOCK_ALL")) return;
+    int unlock = cfg_bool("MKW_UNLOCK_ALL"), bench = bench_on();
+    if (done || n < 16 || strcmp(host_path + n - 16, "Play/account.sav") || !(unlock || bench)) return;
     done = 1;
     if (kind != M_SAVE) {
-        rt_log("unlock: account.sav opened from a read-only mount: not edited");
+#ifdef MKW_WITH_BENCH
+        rt_log("unlock: account.sav opened from a read-only mount: not edited (MKW_UNLOCK_ALL, MKW_BENCH)");
+#else
+        rt_log("unlock: account.sav opened from a read-only mount: not edited (MKW_UNLOCK_ALL)");
+#endif
         return;
     }
     uint64_t size = 0;
     uint8_t *data = plat_file_read(host_path, &size);
-    if (data && unlock_save(data, size) && !plat_file_write_atomic(host_path, data, size))
-        rt_log("unlock: cannot write %s", host_path);
+    int changed = 0;
+    if (data && unlock) changed |= unlock_save(data, size) != 0;
+    if (data && bench) changed |= bench_save(data, size);
+    if (changed && !plat_file_write_atomic(host_path, data, size)) rt_log("unlock: cannot write %s", host_path);
     free(data);
 }
 
 static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     presence_file_opened(path);   // core/presence: what the Discord profile says the player does
     if (romfs_owns(path)) {
-        skip_file_opened(path);   // core/hacks/skip.c: MKW_SKIP_MOVIES
+        skip_file_opened(path);     // core/hacks/skip.c: MKW_SKIP_MOVIES
+        bench_romfs_opened(path);   // core/diag/bench.c: MKW_BENCH=gp ends at the cup's ending movie
         return romfs_open(out, path, mode);
     }
     fs_trace(mode & FS_OPEN_WRITE ? "write" : "read", path);
@@ -917,6 +928,7 @@ static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     if (kind == M_SAVE_RO && (mode & FS_OPEN_WRITE)) return FS_R_UNSUPPORTED_OPEN;
     unlock_on_open(p, kind);
     int save_writer = kind == M_SAVE && (mode & FS_OPEN_WRITE);
+    if (save_writer) bench_save_write(p);   // MKW_BENCH: a time trial saves when it ends
     int err = 0;
     PlatFile *f = plat_fs_open(p, (mode & FS_OPEN_WRITE) != 0, &err);
     if (!f) return fs_result(err);

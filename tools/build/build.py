@@ -522,6 +522,10 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="write build.ninja and show what would run")
     ap.add_argument("--compile-only", action="store_true", help="the objects only, no link (the PS5 target for now)")
     ap.add_argument(
+        "--bench", action="store_true",
+        help="test builds: the benchmark (MKW_BENCH, runtime/core/diag/bench.c) compiled in; never in a release",
+    )  # fmt: skip
+    ap.add_argument(
         "--frame-pointers",
         action="store_true",
         help="runtime with frame pointers: perf call graphs (-g) of where threads block, e.g. -e cs",
@@ -602,6 +606,7 @@ def main() -> None:
         dist.mkdir(parents=True, exist_ok=True)
         (dist / "mkwgame.id").write_text(game_id())
     fp = ["-fno-omit-frame-pointer", "-mno-omit-leaf-frame-pointer"] if args.frame_pointers else []
+    fp += ["-DMKW_WITH_BENCH"] if args.bench else []
     ninja = (
         # the lifted code and its library take the sysroot only for another CPU: an x86-64 release's stay as they were
         ninja_file(

@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bench.h"
 #include "cfg.h"
 #include "flight.h"
 #include "gfx.h"
@@ -292,6 +293,7 @@ void perf_present(uint64_t frame) {
     prof_render_tid = plat_thread_id();
     if (rt_trace & RT_TRACE_SCHED) kern_sched_report(frame);
     seqwatch_frame(frame);
+    bench_frame(frame);   // MKW_BENCH (bench.c): the race's frame times, and the exit at its finish
     if (!seqwatch_window()) hostfn_time_report(frame);
     uint64_t now = kern_now_ns(), d = last ? now - last : 0;
     prof_sampler_frame(frame, now, last ? d : 0);

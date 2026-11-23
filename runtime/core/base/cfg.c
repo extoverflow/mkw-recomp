@@ -186,6 +186,12 @@ static const CfgRow rows[] = {
     // they act only while turbo is hold/toggle or the freeze keys are on, so the console's pad is unchanged by default
     S("HACK_PAD", "hacks", "minus", "off|minus|lstick", LIVE),
     S("QUICK_RACE", "hacks", "off", "off|tt|gp|free", RESTART),
+    // the benchmark (core/diag/bench.c, from mkw-pit-stop): races with no player, timed, then the title ends; test
+    // builds only (MKW_WITH_BENCH, build.py --bench)
+#ifdef MKW_WITH_BENCH
+    S("BENCH", "hacks", "off", "off|tt|gp", RESTART),
+    S("BENCH_MAX", "hacks", "0", "0..3600", RESTART),
+#endif
     S("CLASSIC_GP", "hacks", "0", "0|1", LIVE),   // core/hacks/classic.c: the cups' intermissions become laps on one course
     S("CLASSIC_VS", "hacks", "0", "0|1", LIVE),   // core/hacks/classic.c: VS races' routes become laps on one course
     // no menu row
@@ -677,9 +683,24 @@ const char *cfg_video_failed(const char *err, char *out, int size) {
     return out;
 }
 
+// MKW_BENCH=tt|gp's way in, for the keys the player did not set: the quick race of its mode, seed 1, movies skipped
+// (from mkw-pit-stop cfg.c:661-663, 744-748 @ 0a0259d).
+#ifdef MKW_WITH_BENCH
+static const struct { const char *key, *value; } BENCH[] = {
+    {"QUICK_RACE", NULL}, {"SEED", "1"}, {"SKIP_MOVIES", "1"},
+};
+#endif
+
 const char *cfg_get(const char *name) {
     const char *v = raw_get(name);
     if (v || strncmp(name, PREFIX, PREFIX_LEN)) return v;
+#ifdef MKW_WITH_BENCH
+    for (size_t i = 0; i < sizeof BENCH / sizeof *BENCH; i++)   // MKW_BENCH read only for its own keys
+        if (!strcasecmp(BENCH[i].key, name + PREFIX_LEN)) {
+            const char *b = raw_get(PREFIX "BENCH");
+            if (b && (!strcmp(b, "tt") || !strcmp(b, "gp"))) return BENCH[i].value ? BENCH[i].value : b;
+        }
+#endif
     int p = profile_of();
     if (p == 1) {
         for (size_t i = 0; i < sizeof DECK / sizeof *DECK; i++)
