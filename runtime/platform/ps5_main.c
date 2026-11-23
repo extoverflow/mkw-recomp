@@ -294,12 +294,18 @@ static void logq_main(void *arg) {
 // written; a stalled write stops only this thread). Test tools read it before they press anything on the console: a
 // title that died between their checks was started again from the home screen by their next cross (2026-11-19, four
 // times). MKW_PS5_HEARTBEAT=0 turns it off.
+// The same thread ends the title when <data dir>/quit appears (removed first): a way to close it without the
+// controller, for test tools. It runs with the heartbeat off too (arg 0).
 static void heartbeat_main(void *arg) {
-    (void)arg;
-    int fd = open(PS5_DIR "/alive", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return;
+    int beat = arg != NULL, fd = beat ? open(PS5_DIR "/alive", O_WRONLY | O_CREAT | O_TRUNC, 0644) : -1;
     for (;;) {
-        (void)futimens(fd, NULL);
+        if (fd >= 0) (void)futimens(fd, NULL);
+        struct stat st;
+        if (!stat(PS5_DIR "/quit", &st)) {
+            (void)unlink(PS5_DIR "/quit");
+            fprintf(stderr, "[host] ps5: %s/quit found: the title ends\n", PS5_DIR);
+            plat_exit(0);
+        }
         sceKernelUsleep(2000000);
     }
 }
@@ -706,7 +712,7 @@ int main(int argc, char **argv) {
     plat_thread_spawn(dump_watch, NULL, "dump watch", 0);
     logq_start();
     const char *hb = getenv("MKW_PS5_HEARTBEAT");
-    if (!(hb && *hb == '0')) plat_thread_spawn(heartbeat_main, NULL, "heartbeat", 0);
+    plat_thread_spawn(heartbeat_main, (hb && *hb == '0') ? NULL : (void *)1, "heartbeat", 0);   // and the quit file
     plat_thread_spawn(mem_watch, NULL, "mem watch", 0);
     // The SDK's stdio.h expands getc/putc/putchar/fileno/feof inline on FreeBSD's FILE layout unless __isthreaded is
     // set, and the system libc's FILE is not that layout (title run: putchar wrote through a bad pointer). The payload
