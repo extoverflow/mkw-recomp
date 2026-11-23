@@ -178,7 +178,8 @@ int tracing(uint64_t addr) {
 static uint64_t g_glyph_addr;
 static int g_glyph_known;
 static uint32_t g_glyph_gen;
-static void upload(Tex *e);
+static void upload_since(Tex *e, uint32_t since);
+static void upload(Tex *e) { upload_since(e, 0); }
 
 int vk_glyphs_due(void) {
     if (!__atomic_load_n(&g_glyph_known, __ATOMIC_ACQUIRE)) return 0;
@@ -239,14 +240,26 @@ static void up_deswizzle(void *ctx, uint32_t i) {
     nvn_deswizzle_rows(J->d, q->level, q->layer, J->mem, q->dst, q->pitch, r0, r0 + q->band, NULL);
 }
 
-static void upload_(Tex *e);
-static void upload(Tex *e) {
+static uint64_t n_part_ups, n_part_regions, n_part_skipped, n_part_none;   // partial re-uploads (upload_since)
+static int reup_partial(void) {
+    static int on = -1;
+    if (on < 0) on = cfg_get("MKW_TEX_REUP_PARTIAL") ? atoi(cfg_get("MKW_TEX_REUP_PARTIAL")) != 0 : 1;
+    return on;
+}
+
+// since != 0, a re-upload after a write check: only the mip levels and layers whose guest pages carry a generation newer
+// than since are deswizzled and copied (MKW_TEX_REUP_PARTIAL, default 1); the others keep what the image holds. Not
+// when the GPU wrote the image since (gpu_dirty: a full upload then puts the storage's bytes back everywhere, as
+// before). From mkw-pit-stop (MIT, Copyright (c) 2026 Adrià; PS5 work by exploitizm) runtime/gfx/vk/tex/
+// vk_tex_upload.c:582-631 @ 0a0259d (commit 9d49b93), on our upload's region list.
+static void upload_since_(Tex *e, uint32_t since);
+static void upload_since(Tex *e, uint32_t since) {   // upstream's TT_UPLOAD timing around ours (full and partial)
     uint64_t t0 = tt_begin();
-    upload_(e);
+    upload_since_(e, since);
     tt_end(TT_UPLOAD, t0);
 }
 
-static void upload_(Tex *e) {
+static void upload_since_(Tex *e, uint32_t since) {
     static volatile int32_t n_bad, n_undecoded;
     if (tracing(e->pub.addr))
         rt_log("vk: trace %#llx: upload %u of entry %p (%ux%u target %d), submit epoch %u", (unsigned long long)e->pub.addr,
@@ -268,11 +281,50 @@ static void upload_(Tex *e) {
     if (agpu && e->f.astc_bc7 && !acheck && !linear && !drop && vk_texpre_on() &&
         upload_texpre(e, levels, layers, e->f.astc_bc7 == 2))
         goto counted;
+    uint8_t *dirty = NULL;
+    if (since && e->uploaded && !e->gpu_dirty && !linear && n > 1 && !acheck && d->samples <= 1 && reup_partial() &&
+        (dirty = calloc(n, 1))) {
+        uint64_t *offs = calloc(n, sizeof *offs), *spans = calloc(n, sizeof *spans);
+        if (!offs || !spans) free(dirty), dirty = NULL;
+        else {
+            for (uint32_t lv = 0; lv < levels; lv++) {   // each level's span in the storage, block-linear
+                uint32_t w = mip(d->width, lv + drop), h = one_d ? 1 : mip(d->height, lv + drop),
+                         sl = is3d ? mip(d->depth, lv + drop) : 1;
+                uint32_t rb = (w + bw - 1) / bw * (uint32_t)bpb, rows = (h + bh - 1) / bh;
+                unsigned th = 0, td = 0;
+                nvn_tex_level_tiles(d, lv + drop, &th, &td);
+                uint64_t lv_off = nvn_tex_level_offset(d, lv + drop);
+                uint64_t gobs_x = (rb + 63) / 64, blocks_y = (rows + (8u << th) - 1) / (8u << th),
+                         blocks_z = (sl + (1u << td) - 1) / (1u << td);
+                uint64_t span = gobs_x * blocks_y * blocks_z * (512ull << th << td);
+                for (uint32_t ly = 0; ly < layers; ly++)
+                    offs[lv * layers + ly] = (uint64_t)ly * t->L.layer_size + lv_off, spans[lv * layers + ly] = span;
+            }
+            vk_mem_ranges_written_since(e->pub.addr, offs, spans, dirty, n, since);
+        }
+        free(offs), free(spans);
+    }
+    if (dirty) {
+        uint32_t nd = 0;
+        for (uint32_t i = 0; i < n; i++) nd += dirty[i] != 0;
+        n_part_ups++, n_part_regions += n, n_part_skipped += n - nd;
+        if (!(n_part_ups & 1023))
+            rt_log("vk: partial texture re-uploads (MKW_TEX_REUP_PARTIAL): %llu, %llu of %llu levels/layers skipped, %llu "
+                   "with nothing changed", (unsigned long long)n_part_ups, (unsigned long long)n_part_skipped,
+                   (unsigned long long)n_part_regions, (unsigned long long)n_part_none);
+        if (!nd) {   // the written pages were outside every level (padding, a neighbour's bytes): nothing to send
+            n_part_none++;
+            free(dirty);
+            perf_end(PERF_TEX, p0);
+            return;
+        }
+    }
     VkBufferImageCopy *rg = calloc(n, sizeof *rg);
     VkAstcRegion *ar = agpu ? calloc(n, sizeof *ar) : NULL;
     VkDeviceSize total = 0, decoded = 0;
     for (uint32_t lv = 0; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++) {
+            if (dirty && !dirty[lv * layers + ly]) continue;   // unchanged: the image keeps it
             uint32_t w = mip(d->width, lv + drop), h = one_d ? 1 : mip(d->height, lv + drop),
                      sl = is3d ? mip(d->depth, lv + drop) : 1;
             uint64_t texels = (uint64_t)w * h * sl, raw = (uint64_t)(w + bw - 1) / bw * bpb * ((h + bh - 1) / bh) * sl;
@@ -282,6 +334,7 @@ static void upload_(Tex *e) {
             total += (out + 15) & ~15ull;
             decoded += texels * 4;
         }
+    if (dirty) n = k, free(dirty);   // the regions to send (MKW_TEX_REUP_PARTIAL: rg is compacted, see below)
     // In groups (up_group); MKW_ASTC=check in one.
     uint64_t tf = tt_begin();
     vk_upload_flush_over(64ull << 20);   // as vk_tex_texel.c: the load of a capture sent its textures in one batch
@@ -316,7 +369,9 @@ static void upload_(Tex *e) {
         uint32_t items = 0;
         uint64_t raw_all = 0;
         for (k = g0; k < g1; k++) {
-            uint32_t lv = k / layers, ly = k % layers;
+            // (from the region: with MKW_TEX_REUP_PARTIAL the unchanged levels and layers are left out of rg, so k is
+            // not lv * layers + ly)
+            uint32_t lv = rg[k].imageSubresource.mipLevel, ly = rg[k].imageSubresource.baseArrayLayer;
             uint32_t w = rg[k].imageExtent.width, h = rg[k].imageExtent.height, sl = rg[k].imageExtent.depth;
             uint32_t rb = (w + bw - 1) / bw * (uint32_t)bpb, rows = (h + bh - 1) / bh, all = 0;
             size_t raw = (size_t)rb * rows * sl;
@@ -351,7 +406,9 @@ static void upload_(Tex *e) {
                        UP_PAR_MIN >> 10, dz_bytes[0] / 1048576.0, dz_ns[0] / 1e6);
         }
         for (k = g0; k < g1; k++) {
-            uint32_t lv = k / layers, ly = k % layers;
+            // (from the region: with MKW_TEX_REUP_PARTIAL the unchanged levels and layers are left out of rg, so k is
+            // not lv * layers + ly)
+            uint32_t lv = rg[k].imageSubresource.mipLevel, ly = rg[k].imageSubresource.baseArrayLayer;
             uint32_t w = rg[k].imageExtent.width, h = rg[k].imageExtent.height, sl = rg[k].imageExtent.depth;
             uint32_t rb = (w + bw - 1) / bw * (uint32_t)bpb, rows = (h + bh - 1) / bh;
             size_t raw = (size_t)rb * rows * sl;
@@ -682,13 +739,13 @@ void make_fresh(Tex *e) {
         upload(e);
         return;
     }
-    uint32_t now;
+    uint32_t now, before = e->wgen;
     int ch = vk_mem_changed(e->pub.addr, size, e->wgen, &now);
     e->wgen = now;
     e->last_ch = ch;
     if (ch < 0 && e->t.mem && same_storage(e)) return;   // not tracked: the hash decides
     if (ch > 0 && written_same(e)) return;               // written pages, same bytes (MKW_TEX_HASH_WRITTEN)
-    if (ch) upload(e);   // 1 written, -1 not tracked and rewritten: both upload again
+    if (ch) upload_since(e, ch > 0 ? before : 0);   // 1 written (only what changed), -1 not tracked: all again
 }
 
 void upload_first(Tex *e) { upload(e); }
@@ -702,7 +759,7 @@ void upload_again(Tex *e) {
 // after it, during this replay) keeps its write-watch bit and is caught by the next submission's snapshot.
 void make_fresh_snap(Tex *e) {
     if (!e->pub.mirrored || e->pub.gpu_owned) return;
-    uint32_t now;
+    uint32_t now, before = e->wgen;
     n_checks++;
     int ch = vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, submit_epoch, &now);
     e->wgen = now;
@@ -715,6 +772,6 @@ void make_fresh_snap(Tex *e) {
     e->last_ch = ch;
     if (ch < 0 && e->t.mem && same_storage(e)) return;   // not tracked: the hash decides
     if (ch > 0 && written_same(e)) return;               // written pages, same bytes (MKW_TEX_HASH_WRITTEN)
-    if (ch) upload(e);
+    if (ch) upload_since(e, ch > 0 ? before : 0);
 }
 

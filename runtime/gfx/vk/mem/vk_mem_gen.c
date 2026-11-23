@@ -309,3 +309,33 @@ void gen_reset(void) {
     }
     plat_mutex_unlock(&gen_lock);
 }
+
+// Which of n ranges [base + offs[i], + sizes[i]) hold a page written after generation since, from the generation table
+// vk_mem_changed / vk_mem_changed_snap filled (no write-watch query here): dirty[i] 1 or 0, under one shared gen_lock
+// for all of a texture's subresources. From mkw-pit-stop (MIT, Copyright (c) 2026 Adrià; PS5 work by exploitizm)
+// runtime/gfx/vk/mem/vk_mem_gen.c:268-292 @ 0a0259d (commit 9d49b93).
+void vk_mem_ranges_written_since(uint64_t base, const uint64_t *offs, const uint64_t *sizes, uint8_t *dirty, uint32_t n,
+                                 uint32_t since) {
+    gen_lock_s();
+    for (uint32_t i = 0; i < n; i++) {
+        if (!sizes[i]) { dirty[i] = 0; continue; }
+        uint64_t lo = (base + offs[i]) & ~0xfffull, hi = (base + offs[i] + sizes[i] + 0xfff) & ~0xfffull;
+        uint64_t r0 = lo >> REG_SHIFT, r1 = (hi - 1) >> REG_SHIFT;
+        int ch = 0;
+        if (r1 >= SNAP_REGIONS) {
+            ch = 1;   // outside the region table: changed, to be safe
+        } else {
+            for (uint64_t r = r0; r <= r1 && !ch; r++) {
+                if (reg_max[r] <= since) continue;
+                uint64_t a = (r << REG_SHIFT) > lo ? (r << REG_SHIFT) : lo;
+                uint64_t b = ((r + 1) << REG_SHIFT) < hi ? ((r + 1) << REG_SHIFT) : hi;
+                for (; a < b && !ch; a += 1ull << GEN_PAGE_SHIFT) {
+                    uint32_t *s = gen_slot(a, 0);
+                    if (s && *s > since) ch = 1;
+                }
+            }
+        }
+        dirty[i] = (uint8_t)ch;
+    }
+    plat_mutex_unlock_shared(&gen_lock);
+}

@@ -402,6 +402,9 @@ int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
 // The same answer from per-epoch write-watch snapshots of 2 MiB regions: no system call once the regions were queried in
 // this epoch (a guest submission). For checks that may see writes made during the epoch one epoch late.
 int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch, uint32_t *now);
+// dirty[i] = 1 when [base + offs[i], + sizes[i]) holds a page written after generation since (vk_mem_gen.c)
+void vk_mem_ranges_written_since(uint64_t base, const uint64_t *offs, const uint64_t *sizes, uint8_t *dirty, uint32_t n,
+                                 uint32_t since);
 void vk_mem_snap_stats(uint64_t *checks, uint64_t *calls, uint64_t *untracked);   // since the last call
 
 // Upload batch: one command buffer on gfx_queue that texture uploads and texel copies record into. begin/end bracket
