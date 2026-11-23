@@ -25,6 +25,33 @@ static PlatMutex g_lock = PLAT_MUTEX_INIT;
 // VMA's vkAllocateMemory, timed: a new VkDeviceMemory costs the calling thread 8-19 ms or more (the kernel clears its
 // pages; vk_headroom.c), and the title's sparse arrays ask for ~1 GB in one frame. A slow one (5 ms or more) is logged
 // with its thread, the first 8 and then every power of two.
+// The frame-time summary's split of image creation (perf_rep_add): VMA's vkCreateImage and binds.
+static VKAPI_ATTR VkResult VKAPI_CALL timed_create_image(VkDevice d, const VkImageCreateInfo *ci,
+                                                         const VkAllocationCallbacks *cb, VkImage *img) {
+    uint64_t t0 = plat_now_ns();
+    VkResult r = vkCreateImage(d, ci, cb, img);
+    perf_rep_add(REP_VKCREATE, plat_now_ns() - t0), perf_rep_add(REP_VKCREATE_N, 1);
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL timed_bind_image(VkDevice d, VkImage img, VkDeviceMemory mem, VkDeviceSize off) {
+    uint64_t t0 = plat_now_ns();
+    VkResult r = vkBindImageMemory(d, img, mem, off);
+    perf_rep_add(REP_VKBIND, plat_now_ns() - t0);
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL timed_bind_image2(VkDevice d, uint32_t n, const VkBindImageMemoryInfo *bi) {
+    uint64_t t0 = plat_now_ns();
+    VkResult r = vkBindImageMemory2(d, n, bi);
+    perf_rep_add(REP_VKBIND, plat_now_ns() - t0);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL timed_free(VkDevice d, VkDeviceMemory mem, const VkAllocationCallbacks *cb) {
+    uint64_t t0 = plat_now_ns();
+    vkFreeMemory(d, mem, cb);
+    perf_rep_add(REP_VKFREE, plat_now_ns() - t0), perf_rep_add(REP_VKFREE_N, 1);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL timed_alloc(VkDevice d, const VkMemoryAllocateInfo *info,
                                                   const VkAllocationCallbacks *cb, VkDeviceMemory *mem) {
     static int64_t n_slow, ns_all, bytes_all;
@@ -32,11 +59,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL timed_alloc(VkDevice d, const VkMemoryAllo
     // The PS5's GPU memory is the title's direct memory: a new block that would leave less than the reserve free is
     // refused, as at the GPU cap (platform/ps5_main.c ps5_gpu_alloc_ok). VMA's blocks only: imports bring their pages.
     extern int ps5_gpu_alloc_ok(uint64_t bytes);
-    if (!ps5_gpu_alloc_ok(info->allocationSize)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (!ps5_gpu_alloc_ok(info->allocationSize)) return perf_rep_add(REP_ALLOC_REFUSED, 1), VK_ERROR_OUT_OF_DEVICE_MEMORY;
 #endif
     uint64_t t0 = plat_now_ns();
     VkResult r = vkAllocateMemory(d, info, cb, mem);
     int64_t dt = (int64_t)(plat_now_ns() - t0);
+    perf_rep_add(REP_VKALLOC, (uint64_t)dt), perf_rep_add(REP_VKALLOC_N, 1), perf_rep_add(REP_VKALLOC_BYTES, info->allocationSize);
     int64_t all = plat_add64(&ns_all, dt), bytes = plat_add64(&bytes_all, (int64_t)info->allocationSize);
     if (dt >= 5000000) {
         int64_t k = plat_inc64(&n_slow);
@@ -655,7 +683,9 @@ static int create_device(void) {
                                  .flags = (g_vk.has_buffer_device_address ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0) |
                                           (g_vk.has_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0),
                                  .pDeviceMemoryCallbacks = vk_headroom_callbacks()};
-    static const VmaVulkanFunctions vf = {.vkAllocateMemory = timed_alloc};   // the rest from VMA's static imports
+    static const VmaVulkanFunctions vf = {.vkAllocateMemory = timed_alloc, .vkFreeMemory = timed_free,
+                                          .vkCreateImage = timed_create_image, .vkBindImageMemory = timed_bind_image,
+                                          .vkBindImageMemory2KHR = timed_bind_image2};   // the rest from VMA's static imports
     ai.pVulkanFunctions = &vf;
     // MKW_GPU_MEM_LIMIT=<MiB>: a cap on what VMA allocates, split over the heaps by size. On an integrated GPU this
     // memory is system RAM outside the process's cgroup (run47: the global OOM killer took other applications), so

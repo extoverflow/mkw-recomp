@@ -745,7 +745,9 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     uint64_t b0 = op_timing > 0 ? plat_cycles() : 0;
     if (n && rec_diff_on > 0) rec_diff_begin();
     if (n) ru_submission(ex);
+    uint64_t m0 = kern_now_ns();
     if (n) vk_mem_mirror_begin(), vk_usnap_begin(handles, n, fence);
+    uint64_t mir = kern_now_ns() - m0;
     if (pt_on < 0) pt_on = vk_pt_on();
     if (pt_on > 0 && n) vk_pt_submit_begin(ex->cb);
     if (op_timing > 0) op_tsc[OPX_BEGIN] += plat_cycles() - b0, op_cnt[OPX_BEGIN]++;
@@ -753,14 +755,19 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
         if (!handles[i]) rt_fatal("vk: command handle %d of a submission is null", i);
     int par = n ? vk_exec_par(ex, handles, n, op_timing > 0 || pt_on > 0) : 0;
     if (par == 1) part_start = ex->recorded;   // chunks submitted
-    else if (!par)
+    else if (!par) {
+        uint64_t w0 = kern_now_ns();
         for (int i = 0; i < n; i++) walk(ex, nvn_op_first(handles[i]), 0);
+        perf_rep_add(REP_SERIAL, kern_now_ns() - w0);
+    }
     b0 = op_timing > 0 ? plat_cycles() : 0;
     vk_exec_pass_end(ex);
     x_cur = x_here_ex = NULL;
     if (ex->recorded) vk_exec_barrier(ex);   // later submissions see this one's writes
     if (pt_on > 0 && n) vk_pt_submit_end(ex->cb, fence), ex->recorded++;
-    if (n) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
+    m0 = kern_now_ns();
+    if (n) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);
+    perf_rep_add(REP_MIRROR, mir + kern_now_ns() - m0);   // VRAM mirror bytes the GPU wrote go back to guest memory
     if (n && rec_diff_on > 0) rec_diff_end();
     views_release(ex);
     ex->cb = VK_NULL_HANDLE;

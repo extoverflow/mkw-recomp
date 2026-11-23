@@ -88,6 +88,14 @@ void perf_gpu_wait(uint64_t t0) {
     plat_add64(plat_thread_id() == prof_render_tid ? &render_wait_ns : &other_wait_ns, d);
 }
 
+__attribute__((weak)) void plat_mem_self(uint64_t out[4]) { out[0] = out[1] = out[2] = out[3] = 0; }
+
+static volatile int64_t frame_rep[REP_N];   // perf_rep_add since the previous present (frame-time summary)
+
+void perf_rep_add(int kind, uint64_t v) {
+    if (v) __atomic_fetch_add(&frame_rep[kind], (int64_t)v, __ATOMIC_RELAXED);
+}
+
 static volatile int64_t replay_ns;         // perf_replay: summed over the window, any thread
 static volatile int64_t frame_replay_ns;   // the same since the previous present (frame-time summary)
 
@@ -110,7 +118,7 @@ void perf_count(int kind) {
 #define FT_BINS 1024              // 0.25 ms bins up to 256 ms; slower frames land in the last bin
 #define FT_WORST 5
 #define FT_PERIOD_NS 60000000000ull
-typedef struct { uint64_t frame, ns, wait[PERF_N], replay; } FtWorst;
+typedef struct { uint64_t frame, ns, wait[PERF_N], replay, rep[REP_N]; } FtWorst;
 static struct {
     uint64_t t0, frames, sum, over25, over50, over100;
     uint32_t hist[FT_BINS];
@@ -135,6 +143,24 @@ static void ft_report(uint64_t now, const char *tag) {
                    (unsigned long long)w->frame, w->ns / 1e6, w->wait[PERF_PIPE] / 1e6,
                    w->wait[PERF_TEX] / 1e6, w->wait[PERF_ASTC] / 1e6, w->replay / 1e6,
                    (w->wait[PERF_FENCE] + w->wait[PERF_DRAIN]) / 1e6, w->wait[PERF_PACE] / 1e6);
+            const uint64_t *r = w->rep;
+            rt_log("frametime:     replay of frame %llu: cpu %.1f; parallel walk %.1f, wait for chunks %.1f; serial %.1f; "
+                   "mirror %.1f; write-watch queries %.1f, faults %.1f (%llu), memory lock waits %.1f; in the walk: serial head %.1f, "
+                   "texture slot check %.1f; texture checks (any thread): resolve %.1f, freshness %.1f (hash %.1f over %.1f MiB); "
+                   "new textures: create %.1f (%llu), released destroyed %.1f (%llu), content %.1f; create: format scan %.1f, "
+                   "usage probes %.1f, image and memory %.1f, rest %.1f; vkAllocateMemory %.1f (%llu, %.1f MiB), vkFreeMemory %.1f (%llu); "
+                   "vkCreateImage (allocator's) %.1f (%llu), vkBindImageMemory %.1f; images in the game's pools %.1f; "
+                   "first vmaCreateImage %.1f, out-of-memory path %.1f (%llu images), GPU blocks refused %llu",
+                   (unsigned long long)w->frame, r[REP_CPU] / 1e6, r[REP_PAR_WALK] / 1e6, r[REP_PAR_WAIT] / 1e6,
+                   r[REP_SERIAL] / 1e6, r[REP_MIRROR] / 1e6, r[REP_WW] / 1e6, r[REP_FAULT] / 1e6,
+                   (unsigned long long)r[REP_FAULTS], r[REP_LOCKW] / 1e6, r[REP_HEAD] / 1e6, r[REP_PRECHECK] / 1e6,
+                   r[REP_RESOLVE] / 1e6, r[REP_FRESH] / 1e6, r[REP_HASH] / 1e6, r[REP_HASH_BYTES] / 1048576.0,
+                   r[REP_TEX_CREATE] / 1e6, (unsigned long long)r[REP_TEX_NEW], r[REP_TEX_DESTROY] / 1e6,
+                   (unsigned long long)r[REP_TEX_DESTROYED], r[REP_TEX_INIT] / 1e6, r[REP_TC_SCAN] / 1e6, r[REP_TC_PROBE] / 1e6,
+                   r[REP_TC_IMAGE] / 1e6, r[REP_TC_REST] / 1e6, r[REP_VKALLOC] / 1e6, (unsigned long long)r[REP_VKALLOC_N],
+                   r[REP_VKALLOC_BYTES] / 1048576.0, r[REP_VKFREE] / 1e6, (unsigned long long)r[REP_VKFREE_N],
+                   r[REP_VKCREATE] / 1e6, (unsigned long long)r[REP_VKCREATE_N], r[REP_VKBIND] / 1e6, r[REP_POOLPATH] / 1e6,
+                   r[REP_VMA1] / 1e6, r[REP_OOMPATH] / 1e6, (unsigned long long)r[REP_OOM_N], (unsigned long long)r[REP_ALLOC_REFUSED]);
         }
     }
     memset(&ft, 0, sizeof ft);
@@ -155,6 +181,8 @@ void perf_summary_flush(void) {   // at exit (prof_write)
 // Returns the replay time since the previous present.
 static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
     int64_t rep = plat_xchg64(&frame_replay_ns, 0);
+    uint64_t rb[REP_N];
+    for (int k = 0; k < REP_N; k++) rb[k] = (uint64_t)plat_xchg64(&frame_rep[k], 0);
     if (!summary_t0) {   // the first present starts the period; there is no interval yet
         summary_t0 = now;
         ft.t0 = now;
@@ -174,6 +202,7 @@ static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
         ft.worst[i].ns = d;
         memcpy(ft.worst[i].wait, frame_ns, sizeof frame_ns);
         ft.worst[i].replay = (uint64_t)rep;
+        memcpy(ft.worst[i].rep, rb, sizeof rb);
     }
     if (now - summary_t0 >= FT_PERIOD_NS) {
         ft_report(now, "60 s");

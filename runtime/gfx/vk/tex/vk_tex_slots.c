@@ -180,7 +180,9 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
     if (!s->ce || s->cgen != g) {   // resolved again: an entry at its address was created, dropped or released, or the
         view_t v;                   // slot registered (s->ce cleared); an empty result is not kept: image creation may
         int hv;                     // succeed later
+        uint64_t r0 = kern_now_ns();
         s->ce = slot_resolve(s, &v, &hv);   // entry_of may create an entry and bump g: g read before it
+        perf_rep_add(REP_RESOLVE, kern_now_ns() - r0);
         s->cview = v, s->chas_view = (uint8_t)hv;
         s->cgen = g;
         s->cepoch = 0;
@@ -198,7 +200,9 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
                 __atomic_add_fetch(&tex_lead_bytes[b], (int64_t)e->t.L.size, __ATOMIC_RELAXED);
             }
             uint32_t n_up = e->n_up;
+            uint64_t f0 = kern_now_ns();
             make_fresh_snap(e);
+            perf_rep_add(REP_FRESH, kern_now_ns() - f0);
             if (e->pf) tex_pf_first_use(e, n_up);
             e->checked = submit_epoch;
         }

@@ -585,6 +585,13 @@ int rewritten_since_gpu(const Tex *e) {
 // The check runs once per submission: a rewrite of the storage later in the same submission is uploaded at the next
 // one. That is the point (the 627 re-uploads were checks within a few submissions), and a texture the game rewrites
 // mid-submission without a write watch reads the bytes of that submission's start.
+// vk_texpre_hash, timed for the frame-time summary's worst frames (perf_rep_add).
+static uint64_t thash(const void *p, uint64_t n) {
+    uint64_t t0 = kern_now_ns(), h = vk_texpre_hash(p, n);
+    perf_rep_add(REP_HASH, kern_now_ns() - t0), perf_rep_add(REP_HASH_BYTES, n);
+    return h;
+}
+
 static int hash_untracked(void) {
     static int on = -1;
     if (on < 0) {
@@ -606,14 +613,14 @@ static int hash_untracked(void) {
 static void note_storage(Tex *e) {
     if (!hash_untracked() || !e->t.mem) return;
     e->shash_epoch = submit_epoch;
-    e->shash = vk_texpre_hash(e->t.mem, e->t.L.size);
+    e->shash = thash(e->t.mem, e->t.L.size);
 }
 
 static int same_storage(Tex *e) {
     if (!hash_untracked()) return 0;
     if (e->shash_epoch == submit_epoch) return 1;   // checked (and uploaded if needed) in this submission
     e->shash_epoch = submit_epoch;
-    uint64_t h = vk_texpre_hash(e->t.mem, e->t.L.size);
+    uint64_t h = thash(e->t.mem, e->t.L.size);
     if (h == e->shash) return 1;
     e->shash = h;
     return 0;
@@ -639,12 +646,12 @@ static int hash_written(void) {
 // Before an upload: the hash it is checked against next time.
 static void note_written(Tex *e) {
     if (!hash_written() || !e->t.mem) return;
-    e->whash = vk_texpre_hash(e->t.mem, e->t.L.size), e->wfence = e->wr_fence, e->whashed = 1;
+    e->whash = thash(e->t.mem, e->t.L.size), e->wfence = e->wr_fence, e->whashed = 1;
 }
 // A "written" check: 1 when the bytes are those of the last upload and the GPU has not written the image since.
 static int written_same(Tex *e) {
     if (!hash_written() || !e->t.mem || !e->whashed || e->gpu_dirty || e->wr_fence != e->wfence) return 0;
-    uint64_t h = vk_texpre_hash(e->t.mem, e->t.L.size);
+    uint64_t h = thash(e->t.mem, e->t.L.size);
     n_hash_checks++;
     if (h != e->whash) {
         e->whash = h, e->wfence = e->wr_fence;   // upload() follows: this hash is its storage's

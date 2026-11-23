@@ -507,6 +507,7 @@ Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
 }
 
 static Tex *create_tex_(const tex_t *t, const TexKey *k, int defer_init) {
+    uint64_t tc_t = kern_now_ns();   // the frame-time summary's split of image creation (perf_rep_add)
     static volatile int32_t n_unmapped, n_unsupported, n_failed, n_unbound;
     VkCtx *c = vk_ctx();
     const nvn_texdesc *d = &t->d;
@@ -557,6 +558,7 @@ static Tex *create_tex_(const tex_t *t, const TexKey *k, int defer_init) {
                    "sparse %d, alpha %d (BC1 for alpha 1 decoded in every texel %d, %.0f ms decoding)", why[0], all,
                    why[1], why[2], why[3], why[4], why[5], alpha_one, alpha_ns / 1e6);
     }
+    { uint64_t n_ = kern_now_ns(); perf_rep_add(REP_TC_SCAN, n_ - tc_t), tc_t = n_; }
     if (!tex_vk_format_supported(&f)) {
         log_limited(&n_unsupported, "texture format %#x: VkFormat %d lacks features %#x", d->format, (int)f.vk, (unsigned)f.need);
         return NULL;
@@ -660,6 +662,7 @@ static Tex *create_tex_(const tex_t *t, const TexKey *k, int defer_init) {
         ci.usage = usage &= ~optional[i];
         if (optional[i] == VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT) fb_usage = 0;
     }
+    { uint64_t n_ = kern_now_ns(); perf_rep_add(REP_TC_PROBE, n_ - tc_t), tc_t = n_; }
     Tex *e = calloc(1, sizeof *e);
     if (!e) rt_fatal("vk: out of memory for a texture");
     e->key = *k;
@@ -671,16 +674,22 @@ static Tex *create_tex_(const tex_t *t, const TexKey *k, int defer_init) {
     uint64_t ti = tt_begin();
     if (vk_sparse_create(&ci, d, k->addr, L.size, &img, &e->sparse_tail)) e->sparse = 1;
     else if (nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
+        uint64_t pp0 = kern_now_ns();
         if (vkCreateImage(c->device, &ci, NULL, &img) == VK_SUCCESS && !bind_pool_memory(c, e, img)) {
             vkDestroyImage(c->device, img, NULL);
             img = VK_NULL_HANDLE;
             log_limited(&n_unbound, "texture %#llx (%ux%u fmt %#x, %u levels, %u layers) cannot alias its pool memory; "
                         "own memory instead", (unsigned long long)k->addr, w, h, d->format, ci.mipLevels, ci.arrayLayers);
         }
+        perf_rep_add(REP_POOLPATH, kern_now_ns() - pp0);
     }
     if (!img) {
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        uint64_t v0 = kern_now_ns();
         VkResult r = vma_image(c, &ci, &ai, &img, &e->alloc);
+        uint64_t v1 = kern_now_ns();
+        perf_rep_add(REP_VMA1, v1 - v0);
+        if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY) perf_rep_add(REP_OOM_N, 1);
         // Out of memory: released entries kept for a re-use go first, oldest first, then the retry (run115: 1 230
         // released entries held 596 MiB while new textures failed). Their images go to the deferred list; what the
         // GPU finished with is freed by vk_mem_collect.
@@ -706,6 +715,7 @@ static Tex *create_tex_(const tex_t *t, const TexKey *k, int defer_init) {
             vk_mem_relieve(2 * image_bytes(c, &ci) + (16ull << 20), "an image");
             r = vma_image(c, &ci, &ai, &img, &e->alloc);
         }
+        perf_rep_add(REP_OOMPATH, kern_now_ns() - v1);
         if (r != VK_SUCCESS) {
             // Once per shape, up to 64: one texture retried every frame used up the shared limit (run107: a 8192x8192x68
             // array 16 times) and hid the render targets that failed after it.
@@ -725,6 +735,7 @@ static Tex *create_tex_(const tex_t *t, const TexKey *k, int defer_init) {
         }
     }
     tt_end(TT_IMAGE, ti);
+    { uint64_t n_ = kern_now_ns(); perf_rep_add(REP_TC_IMAGE, n_ - tc_t), tc_t = n_; }
     if (e->alloc) {
         VmaAllocationInfo vi;
         vmaGetAllocationInfo(c->vma, e->alloc, &vi);
@@ -764,6 +775,7 @@ static Tex *create_tex_(const tex_t *t, const TexKey *k, int defer_init) {
         init_image(e, vk_upload_begin());
         vk_upload_end();
     }
+    perf_rep_add(REP_TC_REST, kern_now_ns() - tc_t);
     return e;
 }
 

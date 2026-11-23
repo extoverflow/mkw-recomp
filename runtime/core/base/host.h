@@ -36,6 +36,11 @@ void prof_write(void);                          // idempotent; boot.c calls it b
 uint64_t perf_begin(void);                      // start time of a wait; pair with perf_end
 void perf_end(int kind, uint64_t t0);           // counts render-thread time only
 void perf_replay(uint64_t t0);                  // replay (NVN -> Vulkan recording) time on any thread, waits inside it included
+// The frame-time summary's breakdown of a worst frame's replay time (perf_rep_add, any thread; vk_sync.c and
+// vk_exec*.c): the recording thread's CPU time, parallel recording's walk and its wait for the chunk threads, the
+// serial walk, the VRAM mirror/usnap work, and the thread's own write-watch queries, faults and memory-lock waits.
+enum { REP_CPU, REP_PAR_WALK, REP_PAR_WAIT, REP_SERIAL, REP_MIRROR, REP_WW, REP_FAULT, REP_FAULTS, REP_LOCKW, REP_HEAD, REP_PRECHECK, REP_RESOLVE, REP_FRESH, REP_HASH, REP_HASH_BYTES, REP_TEX_CREATE, REP_TEX_NEW, REP_TEX_DESTROY, REP_TEX_DESTROYED, REP_TEX_INIT, REP_TC_SCAN, REP_TC_PROBE, REP_TC_IMAGE, REP_TC_REST, REP_VKALLOC, REP_VKALLOC_N, REP_VKALLOC_BYTES, REP_VKFREE, REP_VKFREE_N, REP_VKCREATE, REP_VKCREATE_N, REP_VKBIND, REP_POOLPATH, REP_VMA1, REP_OOMPATH, REP_OOM_N, REP_ALLOC_REFUSED, REP_N };
+void perf_rep_add(int kind, uint64_t v);
 void perf_replay_thread(void);                  // the calling thread replays for the render thread: perf_end counts its waits
 void perf_main_thread(void);                    // the calling thread is the guest main thread (MKW_PROFILE_MAIN)
 // Events per 60-frame window: graphics pipelines finished by the background workers, draws skipped while pending,

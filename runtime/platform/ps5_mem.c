@@ -178,7 +178,11 @@ static int kpage_prot(uint64_t k) {
 
 // Counters for the title's memory line (ps5_mem_stats): what the faults, the backing and the protection changes cost.
 static uint64_t st_kprot_n, st_kprot_ns, st_back_n, st_back_bytes, st_back_ns, st_fault_n, st_fault_ns;
-static uint64_t st_fault_regen;   // faults whose page was closed or released while it opened outside vm_lock
+static uint64_t st_fault_regen;
+// The calling thread's own totals (plat_mem_self): write-watch query time, fault handler time and count, and its waits
+// for vm_lock (timed only when the lock was busy). Plain per-thread adds: no atomics, no clock read on a free lock.
+static __thread uint64_t me_ww_ns, me_fault_ns, me_faults, me_lockw_ns;
+static void vm_take(void);   // faults whose page was closed or released while it opened outside vm_lock
 static uint64_t st_fault_touch, st_fault_ww, st_fault_other, st_lockwait_ns, st_ww_n, st_ww_bytes, st_ww_ns;
 static uint64_t st_block_fail, st_page_fail, st_hook_after_fail, st_unback_n, st_unback_fail, st_release_fail;
 static volatile int st_unback_r, st_release_r;
@@ -215,6 +219,15 @@ static void gen_bump(uint64_t a, uint64_t n) {
     for (uint64_t b = a / BLOCK; b <= (end - 1) / BLOCK; b++) __atomic_add_fetch(&blk_gen[b], 1, __ATOMIC_SEQ_CST);
 }
 static uint32_t gen_of(uint64_t k) { return __atomic_load_n(&blk_gen[k / BLOCK], __ATOMIC_SEQ_CST); }
+
+static void vm_take(void) {
+    if (plat_mutex_trylock(&vm_lock)) return;
+    uint64_t t0 = plat_now_ns();
+    plat_mutex_lock(&vm_lock);
+    me_lockw_ns += plat_now_ns() - t0;
+}
+
+void plat_mem_self(uint64_t out[4]) { out[0] = me_ww_ns, out[1] = me_fault_ns, out[2] = me_faults, out[3] = me_lockw_ns; }
 
 static int kprot(void *a, size_t n, int prot) {   // mprotect, counted
     if (!(prot & PROT_WRITE)) gen_bump((uint64_t)(uintptr_t)a, n);   // before the stricter protection takes effect
@@ -355,7 +368,7 @@ static int ww_wanted(void) {
 int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
     if (!n || addr + n > PS_LIMIT) return 0;
     watch = watch && ww_wanted();
-    plat_mutex_lock(&vm_lock);
+    vm_take();
     int ok = range_free(addr, n);
     uint64_t lo = addr & ~(KP - 1), hi = (addr + n + KP - 1) & ~(KP - 1), start = lo, end = hi;
     if (ok && kpage_ours(lo)) start += KP;
@@ -380,7 +393,7 @@ void *plat_mem_alloc(size_t n) {
     void *at = NULL;
     n = (n + KP - 1) & ~(size_t)(KP - 1);
     if (!n || sceKernelReserveVirtualRange(&at, n, 0, KP)) return NULL;
-    plat_mutex_lock(&vm_lock);
+    vm_take();
     int ok = nlazy < LAZY_MAX;
     if (ok) lazy[nlazy].lo = (uint64_t)(uintptr_t)at, lazy[nlazy].hi = (uint64_t)(uintptr_t)at + n, nlazy++;
     plat_mutex_unlock(&vm_lock);
@@ -393,7 +406,7 @@ void *plat_mem_alloc(size_t n) {
 void plat_mem_lazy_hook(int (*fn)(uint64_t addr)) { (void)fn; }
 
 int plat_mem_commit(uint64_t addr, size_t n) {
-    plat_mutex_lock(&vm_lock);
+    vm_take();
     st_set(addr, n, PS_RW);
     for (uint64_t k = addr & ~(KP - 1); k < addr + n; k += KP) apply(k);
     plat_mutex_unlock(&vm_lock);
@@ -401,7 +414,7 @@ int plat_mem_commit(uint64_t addr, size_t n) {
 }
 
 int plat_mem_decommit(uint64_t addr, uint64_t n) {
-    plat_mutex_lock(&vm_lock);
+    vm_take();
     st_set(addr, n, PS_RESERVED);
     for (uint64_t k = addr & ~(KP - 1); k < addr + n; k += KP) {
         if (!is_backed(k)) continue;
@@ -424,7 +437,7 @@ int plat_mem_decommit(uint64_t addr, uint64_t n) {
 }
 
 int plat_mem_protect(uint64_t addr, uint64_t n, int prot) {
-    plat_mutex_lock(&vm_lock);
+    vm_take();
     st_set(addr, n, (uint8_t)(PS_NONE + prot));
     // What apply() does page by page, one mprotect per run of backed 16 KiB pages that take the same protection (as
     // ww_close_run): memory.c's mem_freeze makes idle 2 MiB regions read-only through here, 128 calls of ~36 us each
@@ -449,7 +462,7 @@ int plat_mem_protect(uint64_t addr, uint64_t n, int prot) {
 // thread writing a sealed sibling meanwhile is not stopped by the page then).
 static int through(uint64_t addr, void *buf, size_t n, int write) {
     if (!n) return 1;
-    plat_mutex_lock(&vm_lock);
+    vm_take();
     int ok = 1;
     for (uint64_t k = addr & ~(KP - 1); k < addr + n && ok; k += KP) {
         int committed = 0;
@@ -507,7 +520,7 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
         uint16_t *w = ww_of(k);
         if (!w || !(*w & WW_ON)) return UINT64_MAX;
     }
-    plat_mutex_lock(&vm_lock);
+    vm_take();
     int hot_on = ww_hot_wanted();
     for (uint64_t k = addr & ~(KP - 1); k < end && got < max; k += KP) {
         // The lock is let go at each 2 MiB boundary of a long range (its run closed first): a page's state is handled
@@ -517,7 +530,7 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
             ww_close_run(run, run_end, run_prot);
             run = run_end = 0;
             plat_mutex_unlock(&vm_lock);
-            plat_mutex_lock(&vm_lock);
+            vm_take();
         }
         uint16_t *w = ww_of(k);
         if (*w & WW_HOT) {   // open: every committed 4 KiB page of it counts as written
@@ -586,7 +599,9 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
     }
     ww_close_run(run, run_end, run_prot);
     plat_mutex_unlock(&vm_lock);
-    st_add(&st_ww_ns, plat_now_ns() - q0);
+    uint64_t qd = plat_now_ns() - q0;
+    st_add(&st_ww_ns, qd);
+    me_ww_ns += qd;
     return got;
 }
 
@@ -599,7 +614,7 @@ static int in_lazy(uint64_t a);
 
 void ps5_mem_prepare_write(uint64_t a, uint64_t n) {
     if (!n) return;
-    plat_mutex_lock(&vm_lock);
+    vm_take();
     for (uint64_t k = a & ~(KP - 1); k < a + n; k += KP) {
         if (in_lazy(k)) {
             if (!is_backed(k)) back(k, PROT_READ | PROT_WRITE);
@@ -623,7 +638,7 @@ void ps5_mem_prepare_write(uint64_t a, uint64_t n) {
 // range before importing it, paged_vm.cpp:545-605 in ref/Pokopia-Native-PS5), and marked so it is never given back.
 void ps5_mem_gpu_share(uint64_t a, uint64_t n) {
     if (!n) return;
-    plat_mutex_lock(&vm_lock);
+    vm_take();
     for (uint64_t k = a & ~(KP - 1); k < a + n && k < PS_LIMIT; k += KP) {
         Chunk *c = chunk_of(k, 1);   // every page counted, committed or not: ps5_mem_gpu_unshare takes the same range
         size_t i = (k % CHUNK) / KP;
@@ -644,7 +659,7 @@ void ps5_mem_gpu_share(uint64_t a, uint64_t n) {
 static uint64_t st_gpu_unshared, st_gpu_released;
 void ps5_mem_gpu_unshare(uint64_t a, uint64_t n) {
     if (!n) return;
-    plat_mutex_lock(&vm_lock);
+    vm_take();
     for (uint64_t k = a & ~(KP - 1); k < a + n && k < PS_LIMIT; k += KP) {
         Chunk *c = chunk_of(k, 0);
         size_t i = (k % CHUNK) / KP;
@@ -663,7 +678,7 @@ void ps5_mem_gpu_unshare(uint64_t a, uint64_t n) {
 int ps5_mem_writable(uint64_t a, uint64_t n, char *why, size_t cap) {
     if (why && cap) why[0] = 0;
     int ok = 1;
-    plat_mutex_lock(&vm_lock);
+    vm_take();
     for (uint64_t p = a & ~(PG - 1); p < a + n && ok; p += PG)
         ok = in_lazy(p) || (p < PS_LIMIT && st_get(p) == PS_RW);
     for (uint64_t k = a & ~(KP - 1); k < a + n && why && !why[0]; k += KP) {
@@ -705,7 +720,7 @@ static int in_lazy(uint64_t a) {
 static int ps5_fault(uint64_t a, int write) {
     uint64_t k = a & ~(KP - 1);
     if (in_lazy(a)) {
-        plat_mutex_lock(&vm_lock);
+        vm_take();
         int ok = is_backed(k) || back(k, PROT_READ | PROT_WRITE);
         plat_mutex_unlock(&vm_lock);
         return ok ? 1 : -1;
@@ -713,7 +728,7 @@ static int ps5_fault(uint64_t a, int write) {
     int s = st_get(a);
     if (s < PS_NONE) return 0;   // not committed: a real fault
     uint64_t w0 = plat_now_ns();
-    plat_mutex_lock(&vm_lock);
+    vm_take();
     st_add(&st_lockwait_ns, plat_now_ns() - w0);
     int fresh = !is_backed(k), closed = write && ww_closed(k);
     st_add(fresh ? &st_fault_touch : closed ? &st_fault_ww : &st_fault_other, 1);
@@ -730,7 +745,7 @@ static int ps5_fault(uint64_t a, int write) {
         int ps = st_get(p);
         if (ps >= PS_NONE && ps < need && fault_hook) fault_hook(p);
     }
-    plat_mutex_lock(&vm_lock);
+    vm_take();
     // A write to a watched page: all four of its 4 KiB pages marked written (the first write since the last reset
     // faulted here). The page opens after the lock is let go (blk_gen): a close or a release between the two is seen
     // by its generation, and the page is then marked and set again under the lock.
@@ -746,7 +761,7 @@ static int ps5_fault(uint64_t a, int write) {
         st_add(&st_kprot_n, 1), st_add(&st_kprot_ns, plat_now_ns() - t0);
     }
     if (gen_of(k) != g0) {   // closed or released meanwhile: marked again, and the protection the state gives now
-        plat_mutex_lock(&vm_lock);
+        vm_take();
         st_add(&st_fault_regen, 1);
         if (write && is_backed(k)) ww_mark(k);
         int n2 = kpage_prot(k), ok2 = write ? (n2 & PROT_WRITE) != 0 : (n2 & PROT_READ) != 0;
@@ -768,7 +783,9 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
     plat_fault_ret = *(const uint64_t *)(uintptr_t)u->uc_mcontext.mc_rsp;
     int mine = segv && !(err & 16) ? ps5_fault(a, (err & 2) != 0) : 0;
     if (mine > 0) {
-        st_add(&st_fault_ns, plat_now_ns() - t0);
+        uint64_t fd = plat_now_ns() - t0;
+        st_add(&st_fault_ns, fd);
+        me_fault_ns += fd, me_faults++;
         return;
     }
     if (mine < 0) {   // out of memory or page tables for a committed page: say so, then the crash report below
@@ -885,7 +902,7 @@ void plat_aligned_free(void *p) { free(p); }
 // Fresh read-write pages over a range of a reservation (vk_memory.c undoing a placed map): whatever was mapped there
 // goes, the pages are committed read-write and backed again at their first touch.
 int plat_mem_replace_anon(uint64_t addr, uint64_t n) {
-    plat_mutex_lock(&vm_lock);
+    vm_take();
     for (uint64_t k = addr & ~(KP - 1); k < addr + n; k += KP) {
         if (is_backed(k)) unback(k);
         else {
@@ -943,7 +960,7 @@ int ps5_mem_zero_census(char *out, size_t cap) {
             size_t i0 = b / KP, i1 = (b + BLOCK) / KP, any = 0;
             for (size_t i = i0; i < i1 && !any; i += 8) any = c->backed[i / 8];
             if (!any) continue;
-            plat_mutex_lock(&vm_lock);
+            vm_take();
             for (size_t i = i0; i < i1; i++) {
                 if (!(c->backed[i / 8] >> (i % 8) & 1)) continue;
                 uint64_t k = (uint64_t)ci * CHUNK + (uint64_t)i * KP;

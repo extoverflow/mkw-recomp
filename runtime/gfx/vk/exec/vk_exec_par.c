@@ -732,6 +732,8 @@ static void send_ready(int wait) {
     }
 }
 
+static int par_run(VkExec *ex, const uint64_t *handles, int n, uint64_t t0);
+
 int vk_exec_par(VkExec *ex, const uint64_t *handles, int n, int diag) {
     if (!P.subs++) setup();
     if (P.walk_diag && !P.mode) {   // the walk alone
@@ -753,7 +755,15 @@ int vk_exec_par(VkExec *ex, const uint64_t *handles, int n, int diag) {
     // jitter of the scene's draws, the SMAA blend's output for the upscale dispatch, the picture before the HUD for the
     // last pass), which chunks recorded out of order on other threads would mix up: serial while it is on.
     if (vk_tmp_in_order()) return P.n_serial[WHY_TEMPORAL]++, 0;
-    uint64_t t0 = kern_now_ns();
+    uint64_t t0 = kern_now_ns(), head0 = P.head_ns, pre0 = P.pre_ns;
+    int r = par_run(ex, handles, n, t0);
+    perf_rep_add(REP_HEAD, P.head_ns - head0), perf_rep_add(REP_PRECHECK, P.pre_ns - pre0);
+    if (r != 1) perf_rep_add(REP_PAR_WALK, kern_now_ns() - t0);   // the walk, then the rest serial (or nothing)
+    return r;
+}
+
+// vk_exec_par past its serial cases; t0: when it began.
+static int par_run(VkExec *ex, const uint64_t *handles, int n, uint64_t t0) {
     P.handles = handles, P.n = n, P.fence = ex->fence, P.ex = ex, P.sent = 0, P.avail = 0, P.qleft = 0;
     vk_exec_written_share(ex);   // before the head: the chunk threads and this one note at the same fence
     // MKW_REPLAY_PAR_PIPE: chunks handed out from the walk (publish) once prescan rules out an op it could not leave;
@@ -811,6 +821,7 @@ int vk_exec_par(VkExec *ex, const uint64_t *handles, int n, int diag) {
     ex->in_pass = 0, ex->rt_resolved = 0, ex->dirty = VK_EXEC_DIRTY_ALL, ex->barrier_at = ex->last_dispatch = ex->clear_run_at = -1;
     ex->nfbl = 0, ex->fbl_mask = 0, ex->fb_dirty = 0, ex->fb_fs = NULL;
     vk_exec_draw_new_cb();
+    perf_rep_add(REP_PAR_WALK, t1 - t0), perf_rep_add(REP_PAR_WAIT, t2 - t1);
     P.n_par++, P.n_chunks += (uint64_t)P.nch, P.n_draws += (uint64_t)P.plan_draws, P.walk_ns += t1 - t0, P.rec_ns += t2 - t1;
     if (t2 - t1 > P.max_rec_ns) P.max_rec_ns = t2 - t1;
     return 1;

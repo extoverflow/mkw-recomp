@@ -114,7 +114,10 @@ Tex *entry_of(const tex_t *t) {
             tex_alias = cfg_bool("MKW_TEX_ALIAS");
             rt_log("vk: texture aliases: %s", tex_alias ? "a new image takes the live image's content" : "a new image starts empty");
         }
-        if (!(e = create_tex(t, &k, tex_alias))) return NULL;
+        uint64_t c0 = kern_now_ns();
+        e = create_tex(t, &k, tex_alias);
+        perf_rep_add(REP_TEX_CREATE, kern_now_ns() - c0), perf_rep_add(REP_TEX_NEW, 1);
+        if (!e) return NULL;
         perf_count(PERF_CNT_TEX_NEW);
         // released entries of another descriptor at this address are replaced by the new one; a live one holding
         // GPU-written content is the alias source, preferring the one that differs only in swizzle (same_but_swizzle)
@@ -122,13 +125,19 @@ Tex *entry_of(const tex_t *t) {
         Tex *src = NULL;
         for (Tex *p = nvn_hm_get(&by_addr, &k.addr), *nx; p; p = nx) {
             nx = p->next_at;
-            if (p->released) { destroy_idle(p); continue; }
+            if (p->released) {
+                uint64_t d0 = kern_now_ns();
+                destroy_idle(p);
+                perf_rep_add(REP_TEX_DESTROY, kern_now_ns() - d0), perf_rep_add(REP_TEX_DESTROYED, 1);
+                continue;
+            }
             alias = 1;
             if (tex_alias && (!src || (same_but_swizzle(&p->key, &k) && !same_but_swizzle(&src->key, &k))) &&
                 alias_compatible(e, p) && alias_has_gpu_content(p))
                 src = p;
         }
         if (alias) perf_count(PERF_CNT_TEX_ALIAS);
+        uint64_t i0 = kern_now_ns();
         if (tex_alias) {
             if (src && alias_copy(e, src)) {
                 n_alias_copied++;
@@ -146,6 +155,7 @@ Tex *entry_of(const tex_t *t) {
                 }
             }
         }
+        perf_rep_add(REP_TEX_INIT, kern_now_ns() - i0);
         e->next_at = nvn_hm_get(&by_addr, &k.addr);
         nvn_hm_put(&by_addr, &k.addr, e);
         nvn_hm_put(&by_key, &k, e);

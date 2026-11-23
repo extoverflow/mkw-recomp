@@ -33,6 +33,9 @@ void plat_thread_detach(PlatThread *t);   // frees t; the thread runs on
 uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask);
 uint32_t plat_cpu_count(void);            // logical processors
 uint64_t plat_thread_cpu_ns(uint32_t tid);  // CPU time of the thread with id tid (plat_thread_id) so far; 0 unknown
+// The calling thread's memory totals: [0] write-watch query ns, [1] fault handler ns, [2] faults, [3] memory-map lock
+// waits ns (zeros where the platform does not count them).
+void plat_mem_self(uint64_t out[4]);
 uint64_t plat_self_cpu_ns(void);            // CPU time of the calling thread, fine-grained (diagnosis); 0 unknown
 // The logical processors the process may use (bit n = processor n, the first 64), into *all, and the lowest of each
 // physical core among them into *first; returns the number of physical cores, 0 when unknown.
