@@ -160,6 +160,7 @@ __attribute__((noreturn)) void exit_now(RtThread *t);   // kernel.c
 void thread_main(void *p);   // kernel.c
 void sleep_ns(RtThread *t, int64_t ns);   // kernel.c
 extern RtThread *g_core_owner[NCORE], *g_core_wait;   // kernel_cores.c
+extern uint32_t g_core_wait_mask;   // kernel_cores.c: mask of cores needed by waiting threads
 int cores_enabled(void);   // kernel_cores.c
 void core_take_num(RtThread *t);
 int core_allowed(const RtThread *t, int c);   // kernel_cores.c

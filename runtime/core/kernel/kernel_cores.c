@@ -17,6 +17,16 @@
 // once; guest code without either keeps the core until it reaches one. MKW_FREE_CORES=1 turns the gate off (the game
 // crashes); MKW_CORE_NUM_GATE keeps it only for threads that read their core number (core_take_num).
 RtThread *g_core_owner[NCORE], *g_core_wait;
+// The cores some waiting thread may take (each waiter's mask, OR'd), kept atomically so a yield can see without the
+// kernel lock that it has no one to hand its core to (kernel_svc.c). From mkw-pit-stop (MIT, Copyright (c) 2026
+// Adrià; PS5 work by exploitizm) runtime/core/kernel/kernel_cores.c:21, 55-58 @ 0a0259d (commit 47795a9).
+uint32_t g_core_wait_mask;
+
+static void core_wait_mask_update(void) {
+    uint32_t m = 0;
+    for (const RtThread *p = g_core_wait; p; p = p->cnext) m |= (uint32_t)(p->mask & APP_MASK);
+    __atomic_store_n(&g_core_wait_mask, m, __ATOMIC_RELEASE);
+}
 static int g_cores_on = -1, g_num_gate, g_held_max;
 
 
@@ -60,6 +70,7 @@ static void core_grant(int c) {
     if (!b) return;
     *bp = b->cnext;
     b->cnext = NULL;
+    core_wait_mask_update();
     b->cur_core = c;
     g_core_owner[c] = b;
     core_count();
@@ -183,6 +194,7 @@ static void core_take_gated(RtThread *t) {
     t->cseq = ++g_wseq;
     t->cnext = g_core_wait;
     g_core_wait = t;
+    core_wait_mask_update();
     t->target = NULL;
     if (g_diag > 0) {
         t->dg_since = kern_now_ns();

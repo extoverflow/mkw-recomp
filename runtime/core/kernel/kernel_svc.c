@@ -149,6 +149,23 @@ int kern_svc(Cpu *c, uint32_t imm) {
             return 1;
         }
         // Yield: hand the core to a waiting thread of equal or better priority.
+        // MKW_YIELD_NOLOCK (default 1, "ab" to compare): when no waiting thread may take this core (its bit is clear
+        // in g_core_wait_mask, kept atomically), there is nothing to hand off and the kernel lock is not taken; a
+        // waiter that comes after the check is the same race as one after the locked scan below. MKW_YIELD_PAUSE
+        // (default 1, "ab"): then a CPU pause 15 times of 16 and a real yield on the 16th, so host threads cannot
+        // starve on long spins. ~590 yields a frame (nn::os::YieldThread in the job system's spin loops).
+        // From mkw-pit-stop (MIT, Copyright (c) 2026 Adrià; PS5 work by exploitizm) runtime/core/kernel/
+        // kernel_svc.c:152-169 @ 0a0259d (commits 47795a9, 30b6f62: render busy -0.83 ms/f there).
+        static int nolock = -1, ypause = -1;
+        if (nolock < 0) nolock = rt_knob("YIELD_NOLOCK", "1");
+        if (ypause < 0) ypause = rt_knob("YIELD_PAUSE", "1");
+        if (RT_KNOB_ON(nolock) && t->cur_core >= 0 &&
+            !((__atomic_load_n(&g_core_wait_mask, __ATOMIC_ACQUIRE) >> t->cur_core) & 1u)) {
+            static _Thread_local uint32_t y_cnt;
+            if (RT_KNOB_ON(ypause) && (++y_cnt & 15u) != 0) plat_pause();
+            else plat_yield();
+            return 1;
+        }
         lock();
         int give = 0;
         int tp = prio_of(t);
