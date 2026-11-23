@@ -178,6 +178,7 @@ static int kpage_prot(uint64_t k) {
 
 // Counters for the title's memory line (ps5_mem_stats): what the faults, the backing and the protection changes cost.
 static uint64_t st_kprot_n, st_kprot_ns, st_back_n, st_back_bytes, st_back_ns, st_fault_n, st_fault_ns;
+static uint64_t st_fault_regen;   // faults whose page was closed or released while it opened outside vm_lock
 static uint64_t st_fault_touch, st_fault_ww, st_fault_other, st_lockwait_ns, st_ww_n, st_ww_bytes, st_ww_ns;
 static uint64_t st_block_fail, st_page_fail, st_hook_after_fail, st_unback_n, st_unback_fail, st_release_fail;
 static volatile int st_unback_r, st_release_r;
@@ -201,7 +202,22 @@ static inline void st_add(uint64_t *v, uint64_t d) { __atomic_fetch_add(v, d, __
 #define PROT_GPU_RW 0x30   // GPU read 0x10, GPU write 0x20
 int sceKernelMprotect(const void *addr, size_t len, int prot);
 
+// A generation per 2 MiB block of the guest, bumped before anything in it is made stricter (kprot without write) or
+// released (unback). The write-watch fault opens its page after letting vm_lock go (ps5_fault): the open's
+// mprotect held the lock ~40 us a fault, and faulting threads waited 108.5 s for it in a 22-minute Grand Prix (run
+// 207a, 2026-11-22: 74.6 s held there over 1.85 M faults). A close that came in between shows as a new generation:
+// the fault then marks its page written again under the lock, so a page left open is never unmarked (at worst one
+// upload more, never a lost write).
+static volatile uint32_t blk_gen[PS_LIMIT / BLOCK];
+static void gen_bump(uint64_t a, uint64_t n) {
+    if (a >= PS_LIMIT) return;
+    uint64_t end = a + n < PS_LIMIT ? a + n : PS_LIMIT;
+    for (uint64_t b = a / BLOCK; b <= (end - 1) / BLOCK; b++) __atomic_add_fetch(&blk_gen[b], 1, __ATOMIC_SEQ_CST);
+}
+static uint32_t gen_of(uint64_t k) { return __atomic_load_n(&blk_gen[k / BLOCK], __ATOMIC_SEQ_CST); }
+
 static int kprot(void *a, size_t n, int prot) {   // mprotect, counted
+    if (!(prot & PROT_WRITE)) gen_bump((uint64_t)(uintptr_t)a, n);   // before the stricter protection takes effect
     uint64_t t0 = plat_now_ns();
     int r = sceKernelMprotect(a, n, prot ? prot | PROT_GPU_RW : prot);
     st_add(&st_kprot_n, 1), st_add(&st_kprot_ns, plat_now_ns() - t0);
@@ -293,6 +309,7 @@ static void unback(uint64_t k) {
         return;
     }
     void *at = (void *)(uintptr_t)k;
+    gen_bump(k, KP);   // before the page goes: a fault opening it outside vm_lock sees it (ps5_fault)
     st_add(&st_unback_n, 1);
     __atomic_sub_fetch(&st_guest_now, (int64_t)KP, __ATOMIC_RELAXED);
     int rr = sceKernelReserveVirtualRange(&at, KP, MAP_FIXED, KP);
@@ -715,16 +732,27 @@ static int ps5_fault(uint64_t a, int write) {
     }
     plat_mutex_lock(&vm_lock);
     // A write to a watched page: all four of its 4 KiB pages marked written (the first write since the last reset
-    // faulted here), under the same lock as the opening below, so a reset cannot come between them.
+    // faulted here). The page opens after the lock is let go (blk_gen): a close or a release between the two is seen
+    // by its generation, and the page is then marked and set again under the lock.
     if (write) ww_mark(k);
     int now = kpage_prot(k), allowed = write ? (now & PROT_WRITE) != 0 : (now & PROT_READ) != 0;
-    if (!allowed) {   // a sibling stays stricter: the page opens for this access anyway (counted)
-        kprot((void *)(uintptr_t)k, KP, write ? PROT_READ | PROT_WRITE : PROT_READ);
-        sibling_lifts++;
-    } else {
-        apply(k);   // the protection the state gives now (the write mark above opens a watched page)
-    }
+    int prot = allowed ? now : write ? PROT_READ | PROT_WRITE : PROT_READ, set = !allowed || is_backed(k);
+    if (!allowed) sibling_lifts++;   // a sibling stays stricter: the page opens for this access anyway (counted)
+    uint32_t g0 = gen_of(k);
     plat_mutex_unlock(&vm_lock);
+    if (set) {   // apply()'s mprotect, or the sibling lift's, outside the lock
+        uint64_t t0 = plat_now_ns();
+        sceKernelMprotect((void *)(uintptr_t)k, KP, prot ? prot | PROT_GPU_RW : prot);
+        st_add(&st_kprot_n, 1), st_add(&st_kprot_ns, plat_now_ns() - t0);
+    }
+    if (gen_of(k) != g0) {   // closed or released meanwhile: marked again, and the protection the state gives now
+        plat_mutex_lock(&vm_lock);
+        st_add(&st_fault_regen, 1);
+        if (write && is_backed(k)) ww_mark(k);
+        int n2 = kpage_prot(k), ok2 = write ? (n2 & PROT_WRITE) != 0 : (n2 & PROT_READ) != 0;
+        if (is_backed(k)) kprot((void *)(uintptr_t)k, KP, ok2 ? n2 : write ? PROT_READ | PROT_WRITE : PROT_READ);
+        plat_mutex_unlock(&vm_lock);
+    }
     return 1;
 }
 
@@ -986,12 +1014,12 @@ int ps5_mem_stats(char *out, size_t cap) {
     if (k < 0 || (size_t)k >= cap) return k;
     out += k, cap -= (size_t)k;
     return k + snprintf(out, cap,
-                    "faults %llu (first touch %llu, write watch %llu, other %llu) %.2f s in all; backing %llu calls %.1f MiB "
+                    "faults %llu (first touch %llu, write watch %llu, other %llu, marked again %llu) %.2f s in all; backing %llu calls %.1f MiB "
                     "%.2f s (2 MiB blocks failed %llu, pages failed %llu; last %#llx states %#llx allocate %#x map %#x; hook "
                     "retried unbacked %llu; unback %llu, re-reserve failed %llu (%#x), release failed %llu (%#x)); mprotect %llu %.2f s; fault lock waits %.2f s; write-watch queries %llu, "
                     "%.1f GiB, %.2f s; hot pages made %llu, closed again %llu; GPU pages shared %llu (backed there %llu), kept on decommit %llu, unshared %llu (released then %llu)",
                     (unsigned long long)fn, (unsigned long long)st_fault_touch, (unsigned long long)st_fault_ww,
-                    (unsigned long long)st_fault_other, st_fault_ns / 1e9, (unsigned long long)bn,
+                    (unsigned long long)st_fault_other, (unsigned long long)st_fault_regen, st_fault_ns / 1e9, (unsigned long long)bn,
                     st_back_bytes / 1048576.0, st_back_ns / 1e9, (unsigned long long)st_block_fail,
                     (unsigned long long)st_page_fail, (unsigned long long)st_fail_k, (unsigned long long)st_fail_state,
                     (unsigned)st_fail_ra, (unsigned)st_fail_rm, (unsigned long long)st_hook_after_fail,
