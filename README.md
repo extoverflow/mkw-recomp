@@ -58,6 +58,8 @@ Early, and moving fast (12/11/2026):
   [docs/project/performance.md](docs/project/performance.md).
 - Known problems: a few menus (mode, character and vehicle select) need work, the kart's shadow misses a frame now
   and then, some audio cuts during movies, and on some AMD drivers the GPU can hang. There is no online play.
+- A native PlayStation 5 homebrew build (jailbroken console, 1.8.0): it boots, plays the menus and races, a Grand Prix at
+  54-56 fps on average (23/11/2026). Guide: [docs/project/ps5.md](docs/project/ps5.md).
 
 ## Roadmap
 
@@ -106,6 +108,13 @@ allow `userfaultfd` in the seccomp profile (Docker's default refuses it), or it 
 
 To add your machine to the performance list, open a
 [performance report](https://github.com/adriadam10/mkw-recomp/issues/new?template=performance.yml).
+
+### PlayStation 5
+
+On a jailbroken PS5 the game runs as a homebrew title you build on a Linux PC from your dump: the same game code and
+runtime, compiled for the console, with the graphics on Mesa's RADV for the PS5. It needs a homebrew payload loader,
+`kstuff` and ShadowMountPlus on the console, and only 1.8.0 has been tested. Building, installing, settings and known
+problems: [docs/project/ps5.md](docs/project/ps5.md).
 
 ## Extra features
 
