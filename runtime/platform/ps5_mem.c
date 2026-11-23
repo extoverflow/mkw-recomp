@@ -179,6 +179,7 @@ static int kpage_prot(uint64_t k) {
 // Counters for the title's memory line (ps5_mem_stats): what the faults, the backing and the protection changes cost.
 static uint64_t st_kprot_n, st_kprot_ns, st_back_n, st_back_bytes, st_back_ns, st_fault_n, st_fault_ns;
 static uint64_t st_fault_regen;
+static uint64_t st_batch_pages;   // pages a sequential write fault opened ahead of the faulting one (ww_batch)
 // The calling thread's own totals (plat_mem_self): write-watch query time, fault handler time and count, and its waits
 // for vm_lock (timed only when the lock was busy). Plain per-thread adds: no atomics, no clock read on a free lock.
 static __thread uint64_t me_ww_ns, me_fault_ns, me_faults, me_lockw_ns;
@@ -225,6 +226,42 @@ static void vm_take(void) {
     uint64_t t0 = plat_now_ns();
     plat_mutex_lock(&vm_lock);
     me_lockw_ns += plat_now_ns() - t0;
+}
+
+// Write watch without one global lock: a write-watch fault on a backed page and the replay's queries (plat_mem_written)
+// take vm_lock shared plus the lock of the page's 2 MiB block (one of 64 stripes), so faults and queries on different
+// blocks no longer wait for each other; everything that changes the layout (backing, release, commit, protection,
+// the census) still takes vm_lock alone. A block's pages, their marks and their runs are handled under its stripe.
+// The idea is mkw-pit-stop's (MIT, Copyright (c) 2026 Adrià; PS5 work by exploitizm: runtime/platform/prot_watch.c
+// and ps5_guest_memory.c:461-512 @ 0a0259d, a lock-free fault path and query over per-page atomic states); this is
+// the same separation on our vm_lock and page tables. MKW_PS5_WW_STRIPED=0: every take exclusive, as before.
+static PlatMutex ww_stripe[64];
+static int ww_striped(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("MKW_PS5_WW_STRIPED");
+        on = !(e && !strcmp(e, "0"));
+    }
+    return on;
+}
+static void ww_lock(uint64_t k) {
+    if (!ww_striped()) { vm_take(); return; }
+    if (!plat_mutex_trylock_shared(&vm_lock)) {
+        uint64_t t0 = plat_now_ns();
+        plat_mutex_lock_shared(&vm_lock);
+        me_lockw_ns += plat_now_ns() - t0;
+    }
+    PlatMutex *s = &ww_stripe[(k / BLOCK) & 63];
+    if (!plat_mutex_trylock(s)) {
+        uint64_t t0 = plat_now_ns();
+        plat_mutex_lock(s);
+        me_lockw_ns += plat_now_ns() - t0;
+    }
+}
+static void ww_unlock(uint64_t k) {
+    if (!ww_striped()) { plat_mutex_unlock(&vm_lock); return; }
+    plat_mutex_unlock(&ww_stripe[(k / BLOCK) & 63]);
+    plat_mutex_unlock_shared(&vm_lock);
 }
 
 void plat_mem_self(uint64_t out[4]) { out[0] = me_ww_ns, out[1] = me_fault_ns, out[2] = me_faults, out[3] = me_lockw_ns; }
@@ -520,7 +557,8 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
         uint16_t *w = ww_of(k);
         if (!w || !(*w & WW_ON)) return UINT64_MAX;
     }
-    vm_take();
+    uint64_t held = addr & ~(KP - 1);   // the block whose stripe is held
+    ww_lock(held);
     int hot_on = ww_hot_wanted();
     for (uint64_t k = addr & ~(KP - 1); k < end && got < max; k += KP) {
         // The lock is let go at each 2 MiB boundary of a long range (its run closed first): a page's state is handled
@@ -529,8 +567,8 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
         if (k != (addr & ~(KP - 1)) && !(k & (BLOCK - 1))) {
             ww_close_run(run, run_end, run_prot);
             run = run_end = 0;
-            plat_mutex_unlock(&vm_lock);
-            vm_take();
+            ww_unlock(held);
+            ww_lock(held = k);
         }
         uint16_t *w = ww_of(k);
         if (*w & WW_HOT) {   // open: every committed 4 KiB page of it counts as written
@@ -598,7 +636,7 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
         *w &= (uint16_t)~cleared;
     }
     ww_close_run(run, run_end, run_prot);
-    plat_mutex_unlock(&vm_lock);
+    ww_unlock(held);
     uint64_t qd = plat_now_ns() - q0;
     st_add(&st_ww_ns, qd);
     me_ww_ns += qd;
@@ -717,6 +755,31 @@ static int in_lazy(uint64_t a) {
 // 1 handled, 0 not ours (a real fault, or the hook's), -1 a committed page whose memory could not be mapped: on Linux
 // the kernel never fails a first touch (the OOM killer ends the process instead), so the title stops with a report
 // rather than retrying the access for ever (Step 4: run 21 retried 30,166 failed backings and hung).
+// Sequential write faults over watched pages (a texture or buffer filled front to back) open up to 4 pages at once:
+// a fault right after the previous one's run, in the same 2 MiB block, marks the next pages written too (2, then 4)
+// and opens them with one mprotect. Only pages that are backed, watched, not yet written and wholly read-write join;
+// a page marked ahead that the game then does not write costs at most an upload more. Ramping to 32 pages cut faults
+// 41 % but added false-dirty re-uploads (+396 MiB in 240 s), hence the cap. Off unless MKW_PS5_WW_BATCH=1: on the
+// console it cost more than it saved (23/11/2026, a cup with and without: 702,560 pages opened ahead, fault time 4.7 ->
+// 5.7 s/min, 56.5 -> 53.5 fps; one run each).
+// From mkw-pit-stop (MIT, Copyright (c) 2026 Adrià; PS5 work by exploitizm) runtime/platform/prot_watch.c:332-358
+// @ 0a0259d (commit 9d49b93), on our vm_lock instead of their per-page atomic states.
+static struct { uint64_t next; uint32_t run; } ww_seq[16];   // per (2 MiB block & 15): where the last run ended
+static int ww_batch_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("MKW_PS5_WW_BATCH");
+        on = e && !strcmp(e, "1");
+    }
+    return on;
+}
+static int ww_batchable(uint64_t q) {   // the block's stripe (ww_lock) held
+    if (!is_backed(q) || !ww_closed(q)) return 0;
+    for (uint64_t i = 0; i < SUB; i++)
+        if (st_get(q + i * PG) != PS_RW) return 0;
+    return 1;
+}
+
 static int ps5_fault(uint64_t a, int write) {
     uint64_t k = a & ~(KP - 1);
     if (in_lazy(a)) {
@@ -728,15 +791,19 @@ static int ps5_fault(uint64_t a, int write) {
     int s = st_get(a);
     if (s < PS_NONE) return 0;   // not committed: a real fault
     uint64_t w0 = plat_now_ns();
-    vm_take();
+    ww_lock(k);
     st_add(&st_lockwait_ns, plat_now_ns() - w0);
     int fresh = !is_backed(k), closed = write && ww_closed(k);
+    ww_unlock(k);
     st_add(fresh ? &st_fault_touch : closed ? &st_fault_ww : &st_fault_other, 1);
-    if (fresh && !back(k, kpage_prot(k))) {
+    if (fresh) {   // backing changes the layout: vm_lock alone (and again: another thread may have backed it meanwhile)
+        vm_take();
+        if (!is_backed(k) && !back(k, kpage_prot(k))) {
+            plat_mutex_unlock(&vm_lock);
+            return -1;
+        }
         plat_mutex_unlock(&vm_lock);
-        return -1;
     }
-    plat_mutex_unlock(&vm_lock);
     int own_ok = write ? s == PS_RW : s >= PS_READ;
     if (!own_ok) return 0;   // its own page forbids it: the hook's (a trap, a frozen page) or a crash
     int need = write ? PS_RW : PS_READ;
@@ -745,28 +812,41 @@ static int ps5_fault(uint64_t a, int write) {
         int ps = st_get(p);
         if (ps >= PS_NONE && ps < need && fault_hook) fault_hook(p);
     }
-    vm_take();
+    ww_lock(k);
     // A write to a watched page: all four of its 4 KiB pages marked written (the first write since the last reset
     // faulted here). The page opens after the lock is let go (blk_gen): a close or a release between the two is seen
     // by its generation, and the page is then marked and set again under the lock.
     if (write) ww_mark(k);
     int now = kpage_prot(k), allowed = write ? (now & PROT_WRITE) != 0 : (now & PROT_READ) != 0;
     int prot = allowed ? now : write ? PROT_READ | PROT_WRITE : PROT_READ, set = !allowed || is_backed(k);
-    if (!allowed) sibling_lifts++;   // a sibling stays stricter: the page opens for this access anyway (counted)
+    if (!allowed) st_add(&sibling_lifts, 1);   // a sibling stays stricter: the page opens for this access anyway (counted)
+    uint32_t run = 1;
+    if (write && closed && set && allowed && prot == (PROT_READ | PROT_WRITE) && k < PS_LIMIT && ww_batch_on()) {
+        uint32_t si = (uint32_t)(k / BLOCK & 15);
+        uint32_t want = ww_seq[si].next == k ? (ww_seq[si].run < 4 ? (ww_seq[si].run ? ww_seq[si].run * 2 : 2) : 4) : 1;
+        uint64_t block_end = (k & ~(BLOCK - 1)) + BLOCK;   // one block: one generation covers the whole run
+        while (run < want && k + run * KP < block_end && ww_batchable(k + run * KP)) ww_mark(k + run * KP), run++;
+        ww_seq[si].next = k + run * KP, ww_seq[si].run = run;
+        if (run > 1) st_add(&st_batch_pages, run - 1);
+    }
     uint32_t g0 = gen_of(k);
-    plat_mutex_unlock(&vm_lock);
+    ww_unlock(k);
     if (set) {   // apply()'s mprotect, or the sibling lift's, outside the lock
         uint64_t t0 = plat_now_ns();
-        sceKernelMprotect((void *)(uintptr_t)k, KP, prot ? prot | PROT_GPU_RW : prot);
+        sceKernelMprotect((void *)(uintptr_t)k, run * KP, prot ? prot | PROT_GPU_RW : prot);
         st_add(&st_kprot_n, 1), st_add(&st_kprot_ns, plat_now_ns() - t0);
     }
     if (gen_of(k) != g0) {   // closed or released meanwhile: marked again, and the protection the state gives now
-        vm_take();
+        ww_lock(k);
         st_add(&st_fault_regen, 1);
-        if (write && is_backed(k)) ww_mark(k);
-        int n2 = kpage_prot(k), ok2 = write ? (n2 & PROT_WRITE) != 0 : (n2 & PROT_READ) != 0;
-        if (is_backed(k)) kprot((void *)(uintptr_t)k, KP, ok2 ? n2 : write ? PROT_READ | PROT_WRITE : PROT_READ);
-        plat_mutex_unlock(&vm_lock);
+        for (uint32_t j = 0; j < run; j++) {
+            uint64_t q = k + j * KP;
+            if (!is_backed(q)) continue;
+            if (write) ww_mark(q);
+            int n2 = kpage_prot(q), ok2 = write ? (n2 & PROT_WRITE) != 0 : (n2 & PROT_READ) != 0;
+            kprot((void *)(uintptr_t)q, KP, ok2 ? n2 : write ? PROT_READ | PROT_WRITE : PROT_READ);
+        }
+        ww_unlock(k);
     }
     return 1;
 }
@@ -1035,12 +1115,12 @@ int ps5_mem_stats(char *out, size_t cap) {
     if (k < 0 || (size_t)k >= cap) return k;
     out += k, cap -= (size_t)k;
     return k + snprintf(out, cap,
-                    "faults %llu (first touch %llu, write watch %llu, other %llu, marked again %llu) %.2f s in all; backing %llu calls %.1f MiB "
+                    "faults %llu (first touch %llu, write watch %llu, other %llu, marked again %llu, pages opened ahead %llu) %.2f s in all; backing %llu calls %.1f MiB "
                     "%.2f s (2 MiB blocks failed %llu, pages failed %llu; last %#llx states %#llx allocate %#x map %#x; hook "
                     "retried unbacked %llu; unback %llu, re-reserve failed %llu (%#x), release failed %llu (%#x)); mprotect %llu %.2f s; fault lock waits %.2f s; write-watch queries %llu, "
                     "%.1f GiB, %.2f s; hot pages made %llu, closed again %llu; GPU pages shared %llu (backed there %llu), kept on decommit %llu, unshared %llu (released then %llu)",
                     (unsigned long long)fn, (unsigned long long)st_fault_touch, (unsigned long long)st_fault_ww,
-                    (unsigned long long)st_fault_other, (unsigned long long)st_fault_regen, st_fault_ns / 1e9, (unsigned long long)bn,
+                    (unsigned long long)st_fault_other, (unsigned long long)st_fault_regen, (unsigned long long)st_batch_pages, st_fault_ns / 1e9, (unsigned long long)bn,
                     st_back_bytes / 1048576.0, st_back_ns / 1e9, (unsigned long long)st_block_fail,
                     (unsigned long long)st_page_fail, (unsigned long long)st_fail_k, (unsigned long long)st_fail_state,
                     (unsigned)st_fail_ra, (unsigned)st_fail_rm, (unsigned long long)st_hook_after_fail,
