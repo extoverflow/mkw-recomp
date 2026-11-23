@@ -166,7 +166,8 @@ PS5_WITHOUT = {"gfx/nvn/host/gfx_window_sdl.c",
                "third_party/imgui/backends/imgui_impl_sdlrenderer3.cpp", "ui/launcher/launcher.cpp",
                "ui/launcher/launcher_backdrop.cpp", "ui/launcher/launcher_lastrun.cpp", "ui/launcher/launcher_tools.cpp", "ui/launcher/launcher_setup.cpp", "ui/launcher/launcher_update.cpp",
                "ui/launcher/mods.cpp", "ui/launcher/mods_browse.cpp",  # the launcher's mod manager: launcher.cpp alone
-               "ui/menu/menu_sdl.cpp"}  # fmt: skip
+               "ui/menu/menu_sdl.cpp",
+               "probes/pads_probe.c"}  # fmt: skip  (virtual SDL gamepads; ps5_frontend.c probe_pads says so)
 # The start screen's folder whole: upstream adds pages to it (3042c59: launcher_brand, launcher_finddumps), all SDL3
 # windows and renderers; the PS5 has no start screen (ps5_frontend.c launcher_run).
 PS5_WITHOUT_DIRS = ("ui/launcher/",)

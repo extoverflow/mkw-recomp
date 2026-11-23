@@ -55,6 +55,13 @@ int switch2_battery(uint32_t sdl_id, int *mv) {
 void input_wheel_hint(void) {}
 void input_wheel_map(void) {}
 
+// ---- --probe-pads (probes/pads_probe.c, upstream 96d9eda): it attaches virtual SDL gamepads, which the PS5 SDL subset
+// does not have (its pads are scePad's)
+int probe_pads(void) {
+    rt_log("probe-pads: not on the PS5 (virtual SDL gamepads)");
+    return 1;
+}
+
 // ---- window: platform/ps5_window.c
 
 // ---- start screen (launcher.cpp): none; straight into the mode asked for
