@@ -8,8 +8,9 @@ desktop builds it needs your own copy of the game, and the title you build conta
 
 - It boots, plays the movies, goes through the menus and races, with the console's DualSense controllers and sound.
 - Only Mario Kart World 1.8.0 has been tested on the console.
-- A cup 0 Grand Prix (four races, 1080p, 60 fps setting) averages 54-56 fps: the first race holds 59-60, later races
-  have slower stretches. The slowest frames come where a course streams in new textures.
+- A cup 0 Grand Prix (four races, 1080p) averages 56-57 fps at the PS5's fixed 60 (24/11/2026): the first race holds
+  59-60; in the heavier stretches of the later races a slow frame slows the race a little (game speed 0.97-0.98x)
+  instead of dropping to 30 fps. The slowest frames come where a course streams in new textures.
 - Known problems: a rare one-frame flash where the 3D scene is blank, and a rare crash in the game's code
   (`f_300192aa74`). Free memory goes down race after race; long sessions are still being measured.
 
@@ -97,7 +98,8 @@ they are cached (`pipeline-cache.bin` and `pipeline-keys.bin` in `/data/mkw-reco
 ## Settings for the PS5
 
 The PS5 device profile (`MKW_DEVICE_PROFILE=auto`) sets defaults for the keys `mkw.ini` and `args.txt` do not set,
-among them 1080-line screen passes with the game's own 3D resolution, parallel recording on five threads, a GPU
+among them a fixed 60 fps (`MKW_FPS=60`: smoother than `auto`, which drops single frames to 30), 1080-line screen
+passes with the game's own 3D resolution, parallel recording on five threads, a GPU
 memory cap of 4608 MiB, the pipeline cache saved every 10 minutes, and the shaders kept compressed in memory
 (`runtime/core/base/cfg.c`, the `PS5[]` table). `MKW_DEVICE_PROFILE=desktop` turns it off.
 

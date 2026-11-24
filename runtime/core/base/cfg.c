@@ -551,6 +551,12 @@ static const struct { const char *key, *value; } DECK[] = {
 // frame, 4 times in 15.7 s at the menu, none in 40 s with PIPE_SKIP=strict (recordings v01/v02). GPU_MEM_LIMIT: 6144
 // let the pool's largest free block fall to 3.7 MiB at 300 s (run 28: the game went on, slow and glitchy); 4608 below.
 static const struct { const char *key, *value; } PS5[] = {
+    // A fixed 60 instead of auto: with auto the game took interval 2 (a 33 ms frame) after each slow frame and swapped
+    // 60/30 tens of times per 5 s in the heavy stretches. Grand Prix benchmark, two pairs on the console (24/11/2026):
+    // 56.3 / 56.6 fps against 52.1 / 52.9, frames over 50 ms 247 / 241 against 1,656 / 1,339, no minute under 50
+    // fps; the cost, a slow frame slows the race a little instead (game speed median 0.97-0.98x, the cup ~3.5 %
+    // longer). As in mkw-pit-stop's PS5 profile (cfg.c PS5[] first row @ 0a0259d, MIT).
+    {"FPS", "60"},
     {"MESH_COMPUTE", "1"}, {"PIPE_WORKERS", "4"}, {"SPARSE_IMAGES", "0"}, {"TEX_MAX", "1024"}, {"GPL", "0"},
     {"PIPE_SKIP", "strict"},
     // Screen-space passes at the output's 1080 lines instead of 2560x1440, the 3D scene at the game's own (65 % of

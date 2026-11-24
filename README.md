@@ -59,7 +59,7 @@ Early, and moving fast (12/11/2026):
 - Known problems: a few menus (mode, character and vehicle select) need work, the kart's shadow misses a frame now
   and then, some audio cuts during movies, and on some AMD drivers the GPU can hang. There is no online play.
 - A native PlayStation 5 homebrew build (jailbroken console, 1.8.0): it boots, plays the menus and races, a Grand Prix at
-  54-56 fps on average (23/11/2026). Guide: [docs/project/ps5.md](docs/project/ps5.md).
+  56-57 fps on average (24/11/2026). Guide: [docs/project/ps5.md](docs/project/ps5.md).
 
 ## Roadmap
 
