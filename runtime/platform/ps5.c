@@ -694,6 +694,10 @@ void plat_thread_priority(int prio) { my_prio = prio; }
 void plat_thread_set_priority(PlatThread *t, int prio) { t->prio = prio; }
 
 int plat_thread_priority_get(void) { return my_prio; }
+// Real time for the audio render thread is Linux's (RealtimeKit, linux.c); as on Windows, 0: the caller keeps its
+// priority (HIGHEST).
+int plat_thread_realtime(void) { return 0; }
+void plat_thread_realtime_end(void) {}
 
 void plat_yield(void) { sched_yield(); }
 
