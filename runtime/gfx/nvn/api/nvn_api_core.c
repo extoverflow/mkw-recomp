@@ -849,7 +849,9 @@ static uint64_t early_done(void) { return gfx_backend()->fence_done(); }   // MK
 // list nvn_submit_prepare filled.
 static void early_watch_submit(uint64_t f) {
     if (!nvn_sub_ndst) return;
-    mem_early_set_done(early_done, gfx_backend()->fence_wait, gfx_backend()->fence_queued);
+    // fence_wait_issued: the early-read wait is bounded (mkw-pit-stop memory_early.c ISSUE_WAIT_NS; their
+    // nvn_api_core.c early_watch_submit @ 0109457)
+    mem_early_set_done(early_done, gfx_backend()->fence_wait, gfx_backend()->fence_queued, gfx_backend()->fence_wait_issued);
     for (int i = 0; i < nvn_sub_ndst; i++) mem_early_watch(nvn_sub_dst[i].addr, nvn_sub_dst[i].size, f, nvn_sub_dst[i].kind);
     nvn_sub_ndst = 0;
 }

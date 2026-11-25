@@ -80,6 +80,7 @@ static volatile uint8_t frz[RT_ADDRESS_LIMIT >> FRZ_SHIFT];
 static uint32_t thaw_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: GetTickCount of the last thaw request, 0 never
 static volatile int32_t nfrz;
 PlatMutex frz_lock = PLAT_MUTEX_INIT;   // memory_int.h
+_Thread_local int frz_held;           // memory_int.h (frz_take: a fault under frz_lock stops with a named error)
 static volatile int64_t frz_count[4];   // freezes; thaws by a write fault, by mem_thaw, by a mapping change
 
 int watched(uint64_t addr, uint64_t size) {   // memory_int.h
@@ -120,9 +121,9 @@ static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
 
 void mem_thaw(uint64_t a, uint64_t n) {
     mem_commit_range(a, n);   // a kernel write does not fault into lazy_fault
-    plat_mutex_lock(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
+    frz_take();   // also when nothing is frozen: the hold keeps a read's buffer writable
     thaw_range_locked(a, n, 2);
-    plat_mutex_unlock(&frz_lock);
+    frz_drop();
 }
 
 // frz_lock held exclusively. Makes the committed pages of region r read-only when every one of them is read-write;
@@ -149,7 +150,7 @@ int mem_freeze(uint64_t a) {
     if ((a & (FRZ_SIZE - 1)) || !watched(a, FRZ_SIZE)) return 0;
     uint64_t r = a >> FRZ_SHIFT;
     int ok = 0;
-    plat_mutex_lock(&frz_lock);
+    frz_take();
     if (frz[r]) ok = 1;
     else if (thaw_ms[r] && (int32_t)((uint32_t)plat_now_ms() - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) ok = 0;   // |1 may be ahead
     else if (freeze_locked(r)) {
@@ -158,7 +159,7 @@ int mem_freeze(uint64_t a) {
         plat_inc64(&frz_count[0]);
         ok = 1;
     }
-    plat_mutex_unlock(&frz_lock);
+    frz_drop();
     return ok;
 }
 
@@ -204,13 +205,33 @@ static void fill_locked(uint64_t a, int why) {
 
 static void untrap_range_locked(uint64_t a, uint64_t n) {
     if (!ntrapped && !mem_early_pages && !mem_base_pages() && !mem_spill_pages()) return;
+    // An early-read watch covers whole native pages (16 KiB on the PS5): released over the native pages the range
+    // touches. From mkw-pit-stop (MIT; PS5 work by exploitizm) runtime/core/memory/memory.c:215-222 @ 0109457.
+    if (mem_early_pages) {
+        size_t ep = plat_mem_early_page_size();
+        uint64_t elo = a & ~(uint64_t)(ep - 1);
+        uint64_t ehi = (a + n + ep - 1) & ~(uint64_t)(ep - 1);
+        if (ehi > RT_ADDRESS_LIMIT) ehi = RT_ADDRESS_LIMIT;
+        for (uint64_t p = elo; p < ehi && mem_early_pages; p += PAGE)
+            if (trapped[p / PAGE] == 2) mem_early_release_locked(p, 0);
+    }
     uint64_t end = a + n < RT_ADDRESS_LIMIT ? a + n : RT_ADDRESS_LIMIT;
-    for (uint64_t p = a & ~(PAGE - 1);
-         p < end && (ntrapped || mem_early_pages || mem_base_pages() || mem_spill_pages()); p += PAGE)
-        if (trapped[p / PAGE] == 2) mem_early_release_locked(p, 0);
-        else if (trapped[p / PAGE] == 3) mem_base_fill_locked(p);
+    for (uint64_t p = a & ~(PAGE - 1); p < end && (ntrapped || mem_base_pages() || mem_spill_pages()); p += PAGE)
+        if (trapped[p / PAGE] == 3) mem_base_fill_locked(p);
         else if (trapped[p / PAGE] == 4) mem_spill_fill_locked(p, 2);
-        else if (trapped[p / PAGE]) fill_locked(p, 2);
+        else if (trapped[p / PAGE] == 1) fill_locked(p, 2);
+}
+
+// The trap map alone, for the early-read watch where read traps do not work (the PS5: no write-through, plat_mem_poke
+// fails). From mkw-pit-stop memory.c:232-240 @ 0109457.
+int mem_trapped_init(void) {
+    if (!trapped) {
+        uint8_t *t = plat_mem_alloc(RT_ADDRESS_LIMIT / PAGE);
+        uint8_t *expected = NULL;
+        if (t && !__atomic_compare_exchange_n(&trapped, &expected, t, 0, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE))
+            ;   // another thread set it first (a start-up race: this reservation stays unused, as in theirs)
+    }
+    return trapped != NULL;
 }
 
 int mem_trap_init(void) {   // memory_int.h
@@ -226,10 +247,9 @@ int mem_trap_init(void) {   // memory_int.h
         // fault where the trap needs it to, and one to the trapped page would only if the host page could be made
         // inaccessible as a whole. Off there, with what builds on the map (MKW_EARLY_READ, base traps, spilled pages):
         // the GPU's bytes are copied back at the fence, as on Windows.
+        // (the map itself: mem_trapped_init, which the early-read watch also takes on its own where traps do not work)
         int big = plat_page_size() != PAGE;
-        if (!big && plat_mem_poke((uint64_t)(uintptr_t)&probe, &probe, 1))
-            trapped = plat_mem_alloc(RT_ADDRESS_LIMIT / PAGE);
-        trap_ok = trapped != NULL;
+        trap_ok = !big && plat_mem_poke((uint64_t)(uintptr_t)&probe, &probe, 1) && mem_trapped_init();
         if (big)
             rt_log("mem: read traps off: host pages of %llu KiB (they need 4 KiB); GPU writes are copied back at the "
                    "fence, and MKW_EARLY_READ, base traps and spilled pages are off with them",
@@ -246,7 +266,7 @@ int mem_trap(uint64_t a, uint64_t n, const void *src) {
     if (!mem_trap_init()) return 0;
     const uint8_t *s = src;
     uint64_t lo = (a + PAGE - 1) & ~(PAGE - 1), hi = (a + n) & ~(PAGE - 1);
-    plat_mutex_lock(&frz_lock);
+    frz_take();
     // No region over the range stays frozen. Pages still trapped from an earlier fence stay so: their source is the same
     // shadow bytes (one live shadow per guest page), and filling them again at each fence copied it all back anyway
     // (rt-a1: 1 727 of 1 739 MiB trapped were filled that way).
@@ -305,19 +325,19 @@ int mem_trap(uint64_t a, uint64_t n, const void *src) {
             tsrc[ntsrc++] = (TrapSrc){lo, hi, s + (lo - a)};
         }
     }
-    plat_mutex_unlock(&frz_lock);
+    frz_drop();
     if (!ok) rt_fatal("memory: copying %#llx+%#llx back failed", (unsigned long long)a, (unsigned long long)n);
     return 1;
 }
 
 void mem_untrap(uint64_t a, uint64_t n) {
     if (trap_ok <= 0 || !n) return;
-    plat_mutex_lock(&frz_lock);
+    frz_take();
     untrap_range_locked(a, n);
     for (int i = 0; i < ntsrc;)   // sources inside the range go, and those no trapped page needs any more
         if (tsrc[i].lo >= a && tsrc[i].hi <= a + n) tsrc[i] = tsrc[--ntsrc];
         else i++;
-    plat_mutex_unlock(&frz_lock);
+    frz_drop();
 }
 
 // ---- pages the GPU shares (MKW_UDMABUF, gfx/vk/mem/vk_mem_zc.c)
@@ -329,28 +349,28 @@ static int io_lost;   // reads in flight past IO_N: no range is swapped while th
 
 void mem_io_begin(uint64_t a, uint64_t n) {
     mem_commit_range(a, n);
-    plat_mutex_lock(&frz_lock);
+    frz_take();
     thaw_range_locked(a, n, 2);
     int i = 0;
     while (i < IO_N && io[i].hi) i++;
     if (i < IO_N) io[i].lo = a, io[i].hi = a + n;
     else io_lost++;
-    plat_mutex_unlock(&frz_lock);
+    frz_drop();
 }
 
 void mem_io_end(uint64_t a, uint64_t n) {
-    plat_mutex_lock(&frz_lock);
+    frz_take();
     int i = 0;
     while (i < IO_N && !(io[i].lo == a && io[i].hi == a + n)) i++;
     if (i < IO_N) io[i].lo = io[i].hi = 0;
     else io_lost--;
-    plat_mutex_unlock(&frz_lock);
+    frz_drop();
 }
 
 int mem_share(uint64_t lo, uint64_t hi, const PlatShared *s, uint64_t off) {
     if (!watched(lo, hi - lo)) return 0;
     int ok = 0;
-    plat_mutex_lock(&frz_lock);
+    frz_take();
     for (int i = 0; i < IO_N; i++)
         if (io_lost || (io[i].hi > lo && io[i].lo < hi)) goto out;
     thaw_range_locked(lo, hi - lo, 2);
@@ -365,12 +385,12 @@ int mem_share(uint64_t lo, uint64_t hi, const PlatShared *s, uint64_t off) {
     if (!ok && !plat_mem_protect(lo, hi - lo, PLAT_PROT_RW))
         rt_fatal("memory: %#llx+%#llx kept read-only", (unsigned long long)lo, (unsigned long long)(hi - lo));
 out:
-    plat_mutex_unlock(&frz_lock);
+    frz_drop();
     return ok;
 }
 
 void mem_hold_layout(void) { plat_mutex_lock(&frz_lock); }
-void mem_release_layout(void) { plat_mutex_unlock(&frz_lock); }
+void mem_release_layout(void) { plat_mutex_unlock(&frz_lock); }   // (paired with mem_hold_layout: not counted in frz_held)
 
 int mem_trapped(uint64_t a) { return trapped && a < RT_ADDRESS_LIMIT && __atomic_load_n(&trapped[a / PAGE], __ATOMIC_RELAXED) == 1; }
 
@@ -384,38 +404,75 @@ void mem_trap_stats(uint64_t *now, uint64_t *trapped_pages, uint64_t *access_fil
 // The first write into a frozen region thaws it and retries. A fault in a region another thread thawed meanwhile
 // retries too; an access to a trapped page fills it and retries; any other fault goes on to the crash handler.
 // The platform's fault hook (plat_mem_fault_hook): 1 retries the access.
+// The early-read watch closes whole native pages (plat_mem_early_page_size, 16 KiB on the PS5): a fault anywhere in
+// one with a watched 4 KiB page goes to mem_early_release_locked, which releases the native page (and may emulate a
+// read of an unwatched neighbour). A fault taken with frz_lock held, or the same access faulting again and again, stops
+// with a named error instead of hanging. From mkw-pit-stop (MIT; PS5 work by exploitizm) runtime/core/memory/memory.c:
+// 347-389 @ 0109457.
 static int thaw_fault(uint64_t a) {
     if (a >= RT_ADDRESS_LIMIT || !watched(a, 1)) return 0;
-    if (trapped && __atomic_load_n(&trapped[a / PAGE], __ATOMIC_RELAXED)) {
-        uint64_t wait = 0;   // MKW_EARLY_READ=2: the submit an early read waits for
-        plat_mutex_lock(&frz_lock);
-        if (trapped[a / PAGE] == 2) wait = mem_early_release_locked(a, 1);   // the byte touched
-        else if (trapped[a / PAGE] == 3) mem_base_fill_locked(a);            // a write into a base's page
-        else if (trapped[a / PAGE] == 4) mem_spill_fill_locked(a, 1);        // a spilled page: its bytes from the file
-        else if (trapped[a / PAGE]) fill_locked(a, 1);
-        plat_mutex_unlock(&frz_lock);
-        if (wait) mem_early_wait(wait);
-        return 1;
+    static _Thread_local uint64_t last_a, last_pc, repeats;
+    if (a == last_a && plat_fault_pc == last_pc) {
+        if (++repeats == 100000)
+            rt_fatal("memory: a %s of %#llx at exe+%#llx faults again after every retry (state %d, trap %d)",
+                     plat_fault_write ? "write" : "read", (unsigned long long)a,
+                     (unsigned long long)(plat_fault_pc - plat_exe_base()),
+                     plat_mem_state(a & ~(PAGE - 1), a + 1, &(uint64_t){0}), trapped ? trapped[a / PAGE] : -1);
+    } else {
+        last_a = a, last_pc = plat_fault_pc, repeats = 0;
     }
-    plat_mutex_lock(&frz_lock);
+    if (frz_held)   // the code that faulted holds frz_lock: every path below takes it, so this thread would hang
+        rt_fatal("memory: a %s of %#llx at exe+%#llx faulted with frz_lock held (trap %d)", plat_fault_write ? "write" : "read",
+                 (unsigned long long)a, (unsigned long long)(plat_fault_pc - plat_exe_base()),
+                 trapped ? trapped[a / PAGE] : -1);
+    if (trapped) {
+        size_t ep = plat_mem_early_page_size();
+        uint64_t np = a & ~(uint64_t)(ep - 1);
+        int has_early = 0;
+        for (uint64_t q = np; q < np + ep && q < RT_ADDRESS_LIMIT; q += PAGE)
+            if (__atomic_load_n(&trapped[q / PAGE], __ATOMIC_RELAXED) == 2) {
+                has_early = 1;
+                break;
+            }
+        uint8_t t = __atomic_load_n(&trapped[a / PAGE], __ATOMIC_RELAXED);
+        if (has_early || t == 1 || t == 3 || t == 4) {
+            uint64_t wait = 0;   // MKW_EARLY_READ=2/3: the submit an early read waits for
+            frz_take();
+            int early_now = 0;
+            for (uint64_t q = np; q < np + ep && q < RT_ADDRESS_LIMIT; q += PAGE)
+                if (trapped[q / PAGE] == 2) {
+                    early_now = 1;
+                    break;
+                }
+            if (early_now) wait = mem_early_release_locked(a, 1);   // the byte touched
+            else if (trapped[a / PAGE] == 3) mem_base_fill_locked(a);   // a write into a base's page
+            else if (trapped[a / PAGE] == 4) mem_spill_fill_locked(a, 1);   // a spilled page: its bytes from the file
+            else if (trapped[a / PAGE] == 1) fill_locked(a, 1);
+            frz_drop();
+            if (wait) mem_early_wait(wait);
+            return 1;
+        }
+    }
+    frz_take();
     int was = frz[a >> FRZ_SHIFT];
     thaw_locked(a >> FRZ_SHIFT, 1);
-    plat_mutex_unlock(&frz_lock);
+    frz_drop();
     if (was) return 1;
     uint64_t end;
     int st = plat_mem_state(a & ~(PAGE - 1), (a & ~(PAGE - 1)) + PAGE, &end);
-    if (st != PLAT_PROT_RW && trap_ok > 0)   // the crash report follows: say whether a trap was involved
+    int ok = plat_fault_write ? st == PLAT_PROT_RW : st >= PLAT_PROT_READ;   // a read of a readable page retries too
+    if (!ok && trap_ok > 0)   // the crash report follows: say whether a trap was involved
         rt_log("memory: fault at %#llx: page state %d, not trapped (%lld trapped now)", (unsigned long long)a, st,
                (long long)ntrapped);
-    return st == PLAT_PROT_RW;
+    return ok;
 }
 
 // Mapping changes thaw the regions they touch and run under frz_lock, so no freeze sees them half done.
 static void commit(uint64_t a, uint64_t n, const char *what) {
-    plat_mutex_lock(&frz_lock);
+    frz_take();
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_commit(a, n);
-    plat_mutex_unlock(&frz_lock);
+    frz_drop();
     if (!ok)   // Windows: RAM plus the page file used up (#467); the wiki's Troubleshooting says what to turn on
         rt_fatal("memory: commit %s %#llx+%#llx failed (the system is out of memory: turn on the Windows page file or close "
                  "other programs)", what, (unsigned long long)a, (unsigned long long)n);
@@ -510,18 +567,18 @@ uint64_t mem_runtime_alloc(uint64_t size, const char *what) {
 }
 
 static void decommit(uint64_t a, uint64_t n, const char *what) {
-    plat_mutex_lock(&frz_lock);
+    frz_take();
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_decommit(a, n);
-    plat_mutex_unlock(&frz_lock);
+    frz_drop();
     if (!ok) rt_fatal("memory: decommit %s %#llx+%#llx failed", what, (unsigned long long)a, (unsigned long long)n);
 }
 
 static void protect(uint64_t a, uint64_t n, int prot, const char *what) {
-    plat_mutex_lock(&frz_lock);
+    frz_take();
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_protect(a, n, prot);
-    plat_mutex_unlock(&frz_lock);
+    frz_drop();
     if (!ok) rt_fatal("memory: protect %s %#llx+%#llx failed", what, (unsigned long long)a, (unsigned long long)n);
 }
 
@@ -563,6 +620,9 @@ void mem_init(void) {
         rt_log("mem: host pages of %llu KiB, guest pages of 4: each host page gets the most permissive protection of its "
                "guest pages (the data permission lines count those left more accessible than asked)",
                (unsigned long long)(plat_page_size() >> 10));
+    // A kernel write or a GPU import over a native page the early-read watch closed resolves it first (memory_early.c;
+    // the PS5's ps5_mem.c calls it). From mkw-pit-stop memory.c:555 @ 0109457.
+    plat_mem_early_hold_hook(mem_early_resolve_hold);
     alias_pages = calloc(ALIAS_PAGES, 1);
     if (!alias_pages) rt_fatal("memory: cannot allocate the alias page map");
     // mkw.ini is read here, once the address space is claimed and before the first setting: the pool size below

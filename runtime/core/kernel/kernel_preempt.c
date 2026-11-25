@@ -37,11 +37,39 @@ static uintptr_t g_gen_lo, g_gen_hi;   // host code of the lifted modules: first
 uint64_t g_ap_sent, g_ap_taken, g_ap_host, g_ap_pc, g_ap_deferred, g_ap_fail, g_ap_spin_ok;
 void kern_ap_stub(void);
 
+// MKW_EARLY_READ's waits (memory_early.c): may the access that faulted at rip on this thread wait for the GPU, as the
+// console's read would? Only the game's own code may: a guest thread (tcur) at a rip in the lifted modules with no host
+// call or SVC in progress (host_depth 0) holds no host lock. A runtime thread, or a guest thread in host code (an NVN or
+// SDK call, which may hold the submit's, queue's or shadow's locks), must not. From mkw-pit-stop (MIT; PS5 work by
+// exploitizm) runtime/core/kernel/kernel_preempt.c:37-49, 58-72 @ 0109457.
+static uintptr_t g_lift_lo, g_lift_hi;   // host code of the lifted modules, kept whether or not preemption is on
+
+int kern_fault_in_game(uint64_t rip) {
+    RtThread *t = tcur;
+    if (!t || !g_lift_lo || rip < g_lift_lo || rip > g_lift_hi || !kern_host_track) return 0;
+    return __atomic_load_n(&t->host_depth, __ATOMIC_RELAXED) == 0;
+}
+
 void ap_init(void) {
     if (g_ap >= 0) return;
     const char *e = cfg_value("MKW_ASYNC_PREEMPT");
     g_ap = strcmp(e, "0") != 0;
     g_ap_int = g_ap && strcmp(e, "2") != 0;
+    {   // the lifted code's range, for kern_fault_in_game whether or not preemption is on
+        RtModule m[16];
+        int n = rt_linked_modules(m, 16);
+        uintptr_t lo = UINTPTR_MAX, hi = 0;
+        for (int i = 0; i < n; i++)
+            for (uint64_t k = 0; k < m[i].count; k++) {
+                uintptr_t f = (uintptr_t)m[i].fns[k];
+                if (f < lo) lo = f;
+                if (f > hi) hi = f;
+            }
+        if (n && lo < hi) g_lift_lo = lo, g_lift_hi = hi + 0x10000;   // the last function's size is not known
+        // host_depth is counted from the start when the early-read watch may wait: switched on later, a thread inside
+        // a host call would leave it unbalanced
+        if (mem_early_wanted() > 1) kern_host_track = 1;
+    }
     if (g_ap) {
         RtModule m[16];
         int n = rt_linked_modules(m, 16);

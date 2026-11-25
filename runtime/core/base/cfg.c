@@ -557,6 +557,11 @@ static const struct { const char *key, *value; } PS5[] = {
     // fps; the cost, a slow frame slows the race a little instead (game speed median 0.97-0.98x, the cup ~3.5 %
     // longer). As in mkw-pit-stop's PS5 profile (cfg.c PS5[] first row @ 0a0259d, MIT).
     {"FPS", "60"},
+    // The early-read watch off (submit catch-up stays on, as before): with it on (16 KiB native pages, sibling reads
+    // emulated, mkw-pit-stop's design) a Grand Prix had 10-15 % fewer frames over 33 ms and a steadier 1 % low, the same
+    // fps and frames over 50 ms, but ~1.7x the one-frame blank 3D scenes (three runs each, 24/11/2026). MKW_EARLY_READ=3
+    // turns it on again.
+    {"EARLY_READ", "0"},
     {"MESH_COMPUTE", "1"}, {"PIPE_WORKERS", "4"}, {"SPARSE_IMAGES", "0"}, {"TEX_MAX", "1024"}, {"GPL", "0"},
     {"PIPE_SKIP", "strict"},
     // Screen-space passes at the output's 1080 lines instead of 2560x1440, the 3D scene at the game's own (65 % of

@@ -250,6 +250,34 @@ int64_t plat_mem_resident(const void *p, size_t n);
 // kernel would; no fault reaches the hooks. 1 on success; 0 where the platform cannot (Windows).
 int plat_mem_poke(uint64_t addr, const void *src, size_t n);
 int plat_mem_peek(void *dst, uint64_t addr, size_t n);      // reads through the protection (Linux; Windows: memcpy)
+// The early-read watch's own protection (core/memory/memory_early.c), apart from the guest's page states: on the PS5
+// whole 16 KiB native pages are closed to the CPU (the GPU keeps its access) and opened again as the guest state says.
+// Elsewhere 4 KiB through plat_mem_protect (core/memory/memory_plat.c's weak defaults). From mkw-pit-stop (MIT; PS5
+// work by exploitizm) runtime/platform/platform.h:320-335 @ 0109457.
+size_t plat_mem_early_page_size(void);   // protection granularity for the early-read watch (4 KiB or 16 KiB)
+typedef enum {
+    PLAT_EARLY_FAILED,       // arming failed and the prior state was restored
+    PLAT_EARLY_OK,
+    PLAT_EARLY_UNRESTORED,   // a restore failed; callers must stop without retrying or clearing trap state
+} PlatEarlyResult;
+PlatEarlyResult plat_mem_early_protect(uint64_t addr, size_t n, int on, int restore_prot);
+// A closed native page made readable but not writable, for a copy: a writer still faults, and waits for the caller's
+// lock. The caller closes it again with plat_mem_early_protect(on 1). 0: not possible here. plat_mem_early_gen: changes
+// whenever plat_mem_early_protect touches this native page (or another that shares its counter).
+int plat_mem_early_open_read(uint64_t addr, size_t n);
+uint32_t plat_mem_early_gen(uint64_t addr);
+// fn(addr, n) before a kernel write or a GPU import over [addr, addr+n): the early-read watch resolves its pages there.
+void plat_mem_early_hold_hook(void (*fn)(uint64_t addr, size_t n));
+// The sibling-read emulation (memory_early.c MKW_EARLY_SIBLING_EMU) and single step; 0 where not available (the weak
+// defaults: then the watch waits as before). From mkw-pit-stop platform.h:76-99 @ 0109457.
+enum { PLAT_EMU_CMP = 1, PLAT_EMU_TEST = 2 };
+int plat_fault_emulate_load(uint64_t fault_addr, int extra, int (*rd)(uint64_t ea, size_t n, void *dst));
+int plat_fault_step(void (*fn)(uint64_t arg), uint64_t arg);
+int plat_code_init(void);
+int plat_sample_self_name(char *out, size_t cap);   // the calling thread's name for a log line, 0 unknown
+// The context of the fault being handled on this thread (the platform's fault handler sets it before the hooks), for
+// plat_fault_emulate_load. PS5: platform/ps5_fault_guard.c.
+extern _Thread_local void *plat_fault_uc;
 // Memory the GPU can import as a dma-buf and that can stand in for pages of a reservation (Linux: a memfd and its
 // udmabuf; vk_mem_zc.c). dmabuf goes to the importer, which owns it; map is a read-write view kept until the close.
 typedef struct PlatShared { int memfd, dmabuf; uint8_t *map; uint64_t size; } PlatShared;

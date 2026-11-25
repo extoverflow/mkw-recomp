@@ -187,6 +187,7 @@ void dg_sample(RtThread *t);   // kernel_diag.c
 extern int g_ap, g_ap_int;   // kernel_preempt.c
 extern uint64_t g_ap_sent, g_ap_taken, g_ap_host, g_ap_pc, g_ap_deferred, g_ap_fail, g_ap_spin_ok;   // kernel_preempt.c
 void ap_init(void);   // kernel_preempt.c
+int kern_fault_in_game(uint64_t rip);   // kernel_preempt.c: may a fault at rip on this thread wait (MKW_EARLY_READ)
 int prio_of(const RtThread *t);   // kernel_preempt.c
 volatile uint16_t *ap_tlr(const RtThread *t);   // kernel_preempt.c
 int ap_disabled(const RtThread *t);   // kernel_preempt.c

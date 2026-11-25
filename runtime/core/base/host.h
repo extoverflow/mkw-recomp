@@ -233,6 +233,7 @@ void mem_spill_stats(int64_t out[5]);                      // spilled now; total
 // MKW_EARLY_READ=1 (memory_early.c, a diagnosis): the pages a submit's GPU work writes are watched from the submit
 // (fence: its value) until first touched, counting the game's touches before the GPU finished it.
 int mem_early_on(void);
+int mem_early_wanted(void);   // MKW_EARLY_READ as set (0 off): the kernel counts host calls from the start when > 1
 int mem_early_waits(void);   // an early read of what the GPU writes waits (MKW_EARLY_READ 2 or 3)
 // MKW_FENCE_EARLY (nvn_api_core.c nvnSyncWait): the game's fence waits end once the submit is recorded, before its GPU
 // work; mem_early_rel is the newest fence so released. An early read then also waits for a writer up to it (the console
@@ -240,7 +241,7 @@ int mem_early_waits(void);   // an early read of what the GPU writes waits (MKW_
 extern int mem_fence_early;
 extern uint64_t mem_early_rel;
 void mem_early_set_done(uint64_t (*fence_done)(void), int (*fence_wait)(uint64_t value, uint64_t timeout_ns),
-                        uint64_t (*fence_queued)(void));
+                        uint64_t (*fence_queued)(void), int (*fence_issued_wait)(uint64_t value, uint64_t timeout_ns));
 uint64_t mem_early_inflight(uint64_t a, uint64_t n, uint64_t after);   // a writer of [a, a+n) the GPU runs now, 0 none
 void mem_early_wb_check(uint64_t a, uint64_t n, uint64_t f);            // fence f's merged write-back of [a, a+n)
 void mem_early_watch(uint64_t a, uint64_t n, uint64_t fence, int kind);   // kind: 0 counter, 1 copy, 2 texture to

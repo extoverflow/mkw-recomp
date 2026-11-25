@@ -46,8 +46,11 @@ uint64_t mem_early_inflight(uint64_t a, uint64_t n, uint64_t after) {
     if (!n || mem_early_on() <= 0 || !mem_fence_done || !mem_fence_queued || a + n > RT_ADDRESS_LIMIT) return 0;
     uint64_t done = mem_fence_done(), run = (done > after ? done : after) + 1;
     if (run > mem_fence_queued()) return 0;
-    for (uint64_t p = a & ~(PAGE - 1); p < a + n; p += PAGE)
-        if (mem_lastf[p / PAGE] == run || mem_prevf[p / PAGE] == run) return run;
+    for (uint64_t p = a & ~(PAGE - 1); p < a + n; p += PAGE) {
+        uint64_t lf = 0, pf = 0;
+        mem_early_page_fences(p, &lf, &pf);
+        if (lf == run || pf == run) return run;
+    }
     return 0;
 }
 
