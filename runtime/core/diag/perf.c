@@ -119,7 +119,14 @@ void perf_count(int kind) {
 #define FT_BINS 1024              // 0.25 ms bins up to 256 ms; slower frames land in the last bin
 #define FT_WORST 5
 #define FT_PERIOD_NS 60000000000ull
+// game (diagnostic builds only, MKW_WITH_FRAME_DIAG): MKW_TRACE=sched's game side of the frame (ft_game): the presenting thread's and all guest threads' time per
+// scheduler state, the presenting thread's write-watch, fault and memory-lock time (plat_mem_self) and the process's CPU.
+#ifdef MKW_WITH_FRAME_DIAG
+enum { G_SELF = 0, G_ALL = KERN_ST_N, G_WW = 2 * KERN_ST_N, G_FAULT, G_FAULTS, G_LOCKW, G_PCPU, G_N };
+typedef struct { uint64_t frame, ns, wait[PERF_N], replay, rep[REP_N], game[G_N]; int has_game; } FtWorst;
+#else
 typedef struct { uint64_t frame, ns, wait[PERF_N], replay, rep[REP_N]; } FtWorst;
+#endif
 static struct {
     uint64_t t0, frames, sum, over25, over50, over100;
     uint32_t hist[FT_BINS];
@@ -162,6 +169,19 @@ static void ft_report(uint64_t now, const char *tag) {
                    r[REP_VKALLOC_BYTES] / 1048576.0, r[REP_VKFREE] / 1e6, (unsigned long long)r[REP_VKFREE_N],
                    r[REP_VKCREATE] / 1e6, (unsigned long long)r[REP_VKCREATE_N], r[REP_VKBIND] / 1e6, r[REP_POOLPATH] / 1e6,
                    r[REP_VMA1] / 1e6, r[REP_OOMPATH] / 1e6, (unsigned long long)r[REP_OOM_N], (unsigned long long)r[REP_ALLOC_REFUSED]);
+#ifdef MKW_WITH_FRAME_DIAG
+            if (w->has_game) {   // MKW_TRACE=sched (ft_game)
+                const uint64_t *g = w->game, *s = g + G_SELF, *a = g + G_ALL;
+                rt_log("frametime:     game side of frame %llu: presenting thread running %.1f, waiting for a core %.1f, in host "
+                       "calls %.1f, sleeping %.1f, WaitSynchronization %.1f, condition variables %.1f, locks %.1f, address "
+                       "waits %.1f; its write-watch %.1f, faults %.1f (%llu), memory-lock waits %.1f; all guest threads: running "
+                       "%.1f, waiting for a core %.1f, in host calls %.1f (thread-ms); process CPU %.1f ms (%.1f cores)",
+                       (unsigned long long)w->frame, s[1] / 1e6, s[2] / 1e6, s[3] / 1e6, s[4] / 1e6, s[5] / 1e6, s[6] / 1e6,
+                       s[7] / 1e6, s[8] / 1e6, g[G_WW] / 1e6, g[G_FAULT] / 1e6, (unsigned long long)g[G_FAULTS],
+                       g[G_LOCKW] / 1e6, a[1] / 1e6, a[2] / 1e6, a[3] / 1e6, g[G_PCPU] / 1e6,
+                       w->ns ? (double)g[G_PCPU] / (double)w->ns : 0.0);
+            }
+#endif
         }
     }
     memset(&ft, 0, sizeof ft);
@@ -179,8 +199,32 @@ void perf_summary_flush(void) {   // at exit (prof_write)
     summary_t0 = 0;
 }
 
+#ifdef MKW_WITH_FRAME_DIAG
+// MKW_TRACE=sched: the game side of the frame since the previous present, as differences of running totals; 0 when the
+// trace is off (the flag is read first).
+static int ft_game(uint64_t out[G_N]) {
+    if (!(rt_trace & RT_TRACE_SCHED)) return 0;
+    static uint64_t prev[G_N];
+    static int have;
+    uint64_t cur[G_N] = {0}, me[4];
+    if (!kern_frame_states(cur + G_SELF, cur + G_ALL)) return 0;
+    plat_mem_self(me);
+    cur[G_WW] = me[0], cur[G_FAULT] = me[1], cur[G_FAULTS] = me[2], cur[G_LOCKW] = me[3];
+    cur[G_PCPU] = plat_process_cpu_ns();
+    for (int k = 0; k < G_N; k++) out[k] = cur[k] - prev[k];
+    memcpy(prev, cur, sizeof prev);
+    int ok = have;
+    have = 1;
+    return ok;
+}
+#endif
+
 // Returns the replay time since the previous present.
 static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
+#ifdef MKW_WITH_FRAME_DIAG
+    uint64_t gm[G_N];
+    int has_game = ft_game(gm);
+#endif
     int64_t rep = plat_xchg64(&frame_replay_ns, 0);
     uint64_t rb[REP_N];
     for (int k = 0; k < REP_N; k++) rb[k] = (uint64_t)plat_xchg64(&frame_rep[k], 0);
@@ -204,6 +248,10 @@ static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
         memcpy(ft.worst[i].wait, frame_ns, sizeof frame_ns);
         ft.worst[i].replay = (uint64_t)rep;
         memcpy(ft.worst[i].rep, rb, sizeof rb);
+#ifdef MKW_WITH_FRAME_DIAG
+        ft.worst[i].has_game = has_game;
+        if (has_game) memcpy(ft.worst[i].game, gm, sizeof gm);
+#endif
     }
     if (now - summary_t0 >= FT_PERIOD_NS) {
         ft_report(now, "60 s");

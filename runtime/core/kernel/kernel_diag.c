@@ -48,11 +48,20 @@ static void wait_add(WaitRec *w, int st, uint64_t obj, uint32_t waker, uint64_t 
 }
 
 // Close the current state's interval and enter st.
+#ifdef MKW_WITH_FRAME_DIAG
+static uint64_t g_st_all[S_N];   // every guest thread's state time, never reset (kern_frame_states)
+#endif
+
 void acct(RtThread *t, int st) {
     if (!(rt_trace & RT_TRACE_SCHED)) return;
     uint64_t now = kern_now_ns();
     if (t->st_since) {
-        t->st_ns[t->st] += now - t->st_since;
+        uint64_t d = now - t->st_since;
+        t->st_ns[t->st] += d;
+#ifdef MKW_WITH_FRAME_DIAG
+        t->st_tot[t->st] += d;
+        g_st_all[t->st] += d;
+#endif
         if (t->st >= S_HOST && (t == g_render || t->is_main)) {
             uint32_t waker = t->st == S_HOST || t->st == S_SLEEP ? 0 : t->waker;
             wait_add(t == g_render ? g_rw : g_mw, t->st, t->wobj, waker, now - t->st_since);
@@ -316,6 +325,24 @@ static void crit_frame(RtThread *self, uint64_t frame) {
     rt_log("crit: %u events, %u threads, frames %llu-%llu%s", g_crit_n, nt, (unsigned long long)g_crit_lo,
            (unsigned long long)g_crit_hi, g_crit_n >= CRIT_N ? " (buffer full: the last frames are incomplete)" : "");
 }
+
+#ifdef MKW_WITH_FRAME_DIAG
+// MKW_TRACE=sched: the calling thread's state time so far (the open interval included) and every guest thread's, in
+// S_* order (KERN_ST_N slots), for the frame summary's game side of its worst frames (perf.c): it keeps the totals of
+// the previous present and takes differences. 0 when the trace is off or the caller is not a guest thread.
+int kern_frame_states(uint64_t self_ns[KERN_ST_N], uint64_t all_ns[KERN_ST_N]) {
+    if (!(rt_trace & RT_TRACE_SCHED) || !tcur) return 0;
+    _Static_assert(S_N == KERN_ST_N, "host.h KERN_ST_N follows kernel_int.h S_N");
+    RtThread *t = tcur;
+    lock();
+    uint64_t now = kern_now_ns(), open = t->st_since ? now - t->st_since : 0;
+    for (int k = 0; k < S_N; k++) self_ns[k] = t->st_tot[k], all_ns[k] = g_st_all[k];
+    self_ns[t->st] += open;
+    all_ns[t->st] += open;   // the other threads' open intervals are left out: a few ms at most, all states alike
+    unlock();
+    return 1;
+}
+#endif
 
 void kern_sched_report(uint64_t frame) {
     static uint64_t last;

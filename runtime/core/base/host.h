@@ -43,6 +43,12 @@ enum { REP_CPU, REP_PAR_WALK, REP_PAR_WAIT, REP_SERIAL, REP_MIRROR, REP_WW, REP_
 void perf_rep_add(int kind, uint64_t v);
 void perf_replay_thread(void);                  // the calling thread replays for the render thread: perf_end counts its waits
 void perf_main_thread(void);                    // the calling thread is the guest main thread (MKW_PROFILE_MAIN)
+// Diagnostic builds only (MKW_WITH_FRAME_DIAG: build.py --frame-diag), with MKW_TRACE=sched (kernel_diag.c): the
+// calling guest thread's time in each scheduler state so far and every guest
+// thread's, in this order: off, running, waiting for a core, in a host call, sleeping, WaitSynchronization, condition
+// variable, lock, address arbiter. 0 when the trace is off or the caller is not a guest thread.
+enum { KERN_ST_N = 9 };
+int kern_frame_states(uint64_t self_ns[KERN_ST_N], uint64_t all_ns[KERN_ST_N]);
 // Events per 60-frame window: graphics pipelines finished by the background workers, draws skipped while pending,
 // first texture uploads and re-uploads after CPU writes, draws that waited for their pending pipeline and got it, draws
 // into a target the previous frame did not render that waited for their pending pipeline instead of being skipped

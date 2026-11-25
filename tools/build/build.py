@@ -526,6 +526,10 @@ def main() -> None:
         help="test builds: the benchmark (MKW_BENCH, runtime/core/diag/bench.c) compiled in; never in a release",
     )  # fmt: skip
     ap.add_argument(
+        "--frame-diag", action="store_true",
+        help="diagnostic builds: the game side of the worst frames with MKW_TRACE=sched (MKW_WITH_FRAME_DIAG); never in a release",
+    )  # fmt: skip
+    ap.add_argument(
         "--frame-pointers",
         action="store_true",
         help="runtime with frame pointers: perf call graphs (-g) of where threads block, e.g. -e cs",
@@ -607,6 +611,7 @@ def main() -> None:
         (dist / "mkwgame.id").write_text(game_id())
     fp = ["-fno-omit-frame-pointer", "-mno-omit-leaf-frame-pointer"] if args.frame_pointers else []
     fp += ["-DMKW_WITH_BENCH"] if args.bench else []
+    fp += ["-DMKW_WITH_FRAME_DIAG"] if args.frame_diag else []
     ninja = (
         # the lifted code and its library take the sysroot only for another CPU: an x86-64 release's stay as they were
         ninja_file(

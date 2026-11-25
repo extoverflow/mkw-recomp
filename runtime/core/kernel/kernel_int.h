@@ -82,6 +82,9 @@ struct RtThread {
     uint32_t tid;              // host thread id
     int st;                    // S_* state since st_since
     uint64_t st_since, st_ns[S_N], nblk, npre, pre_since, cpu_last;
+#ifdef MKW_WITH_FRAME_DIAG
+    uint64_t st_tot[S_N];      // the same, never reset (kern_frame_states: the frame summary takes differences)
+#endif
     uint64_t wobj;             // what the current wait is on: owner handle, key, address or first handle
     uint32_t waker;            // the thread whose signal ended the last wait (0: a host thread or a timeout)
     uint64_t wake_at, grant_at;   // when a wait was signalled and a core granted, until the thread runs again
