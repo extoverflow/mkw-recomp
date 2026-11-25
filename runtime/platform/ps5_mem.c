@@ -85,6 +85,8 @@ typedef struct {
     int64_t *phys;                   // per 16 KiB page: its direct memory; made on the first backing in the chunk
     uint8_t gpu[CHUNK / KP];         // per 16 KiB page: imports covering it (ps5_mem_gpu_share/unshare); not given back while >0
     uint8_t zseen[CHUNK / KP / 8];   // per 16 KiB page: read zero at the last census (ps5_mem_zero_census)
+    uint8_t early[CHUNK / KP / 8];   // per 16 KiB page: closed to the CPU by the early-read watch (plat_mem_early_protect)
+    uint32_t egen[CHUNK / KP];       // per 16 KiB page: plat_mem_early_gen, one step per early protect or open_read
 } Chunk;
 
 static Chunk *chunks[NCHUNK];
@@ -121,6 +123,14 @@ static int is_backed(uint64_t k) {
     Chunk *c = chunk_of(k, 0);
     size_t i = (k % CHUNK) / KP;
     return c && (c->backed[i / 8] >> (i % 8) & 1);
+}
+
+// The early-read watch's bit (memory_early.c through plat_mem_early_protect): the 16 KiB page is closed to the CPU
+// whatever its 4 KiB pages' states, and keeps the GPU's access. Read without a lock by the fault handler (a byte load).
+static int is_early(uint64_t k) {
+    Chunk *c = chunk_of(k, 0);
+    size_t i = (k % CHUNK) / KP;
+    return c && (__atomic_load_n(&c->early[i / 8], __ATOMIC_RELAXED) >> (i % 8) & 1);
 }
 
 static uint16_t *ww_of(uint64_t k) {
@@ -165,8 +175,17 @@ static void ww_mark(uint64_t k) {
 
 static int prot_of(int ps) { return ps == PS_RW ? PROT_READ | PROT_WRITE : ps == PS_READ ? PROT_READ : PROT_NONE; }
 
-// The protection a backed 16 KiB page gets: the strictest of its committed 4 KiB pages (none committed: none).
+// kpage_prot's flag (not a PROT_ bit): no CPU access, the GPU's kept. The early-read watch closes a page the GPU may
+// write (an import covers it): without its GPU bits the GPU would lose the page (run 119, 15/11/2026, died a minute in).
+#define KP_GPU 0x10000
+
+// The protection a backed 16 KiB page gets: the strictest of its committed 4 KiB pages (none committed: none); a page
+// the early-read watch closed has none for the CPU (KP_GPU when an import covers it).
 static int kpage_prot(uint64_t k) {
+    if (is_early(k)) {
+        Chunk *c = chunk_of(k, 0);
+        return c && c->gpu[(k % CHUNK) / KP] ? KP_GPU : PROT_NONE;
+    }
     int best = PS_RW + 1;
     for (uint64_t i = 0; i < SUB; i++) {
         int s = st_get(k + i * PG);
@@ -266,10 +285,11 @@ static void ww_unlock(uint64_t k) {
 
 void plat_mem_self(uint64_t out[4]) { out[0] = me_ww_ns, out[1] = me_fault_ns, out[2] = me_faults, out[3] = me_lockw_ns; }
 
-static int kprot(void *a, size_t n, int prot) {   // mprotect, counted
+static int kprot(void *a, size_t n, int prot) {   // mprotect, counted; KP_GPU: no CPU access, the GPU's kept
     if (!(prot & PROT_WRITE)) gen_bump((uint64_t)(uintptr_t)a, n);   // before the stricter protection takes effect
     uint64_t t0 = plat_now_ns();
-    int r = sceKernelMprotect(a, n, prot ? prot | PROT_GPU_RW : prot);
+    int cpu = prot & ~KP_GPU;
+    int r = sceKernelMprotect(a, n, cpu ? cpu | PROT_GPU_RW : (prot & KP_GPU) ? PROT_GPU_RW : PROT_NONE);
     st_add(&st_kprot_n, 1), st_add(&st_kprot_ns, plat_now_ns() - t0);
     return r;
 }
@@ -520,6 +540,87 @@ static int through(uint64_t addr, void *buf, size_t n, int write) {
 }
 
 int plat_mem_poke(uint64_t addr, const void *src, size_t n) { return through(addr, (void *)src, n, 1); }
+
+// ---- The early-read watch's protection (core/memory/memory_early.c; platform.h): one 16 KiB kernel page at a time,
+// apart from the guest's page states, which stay as they are (st_get); opening recomputes the page's protection from
+// them (kpage_prot), so restore_prot is not needed here. Under vm_lock: memory_early.c calls these with frz_lock held
+// (the order frz_lock then vm_lock, as memory.c's freezes). Every touched page's early generation steps once (egen_step),
+// which the sibling snapshot compares. The design is mkw-pit-stop's (MIT; PS5 work by exploitizm) ps5_guest_memory.c:921-1096
+// @ 0109457, written here on this file's page tables and locks.
+static void (*early_hold_fn)(uint64_t addr, size_t n);
+void plat_mem_early_hold_hook(void (*fn)(uint64_t addr, size_t n)) { __atomic_store_n(&early_hold_fn, fn, __ATOMIC_RELEASE); }
+static void early_hold(uint64_t a, uint64_t n) {   // before a kernel write or a GPU import over [a, a+n): no lock held
+    void (*fn)(uint64_t, size_t) = __atomic_load_n(&early_hold_fn, __ATOMIC_ACQUIRE);
+    if (fn) fn(a, n);
+}
+
+size_t plat_mem_early_page_size(void) { return KP; }
+
+// One step per plat_mem_early_protect or plat_mem_early_open_read over the page, nothing else: memory_early.c's snapshot
+// expects exactly +1 from its own re-close (snap_read). Build 219c used the write watch's per-2 MiB blk_gen, which a
+// close moved twice (kprot's own bump) and any protection change nearby moved too: 30,374 sibling reads per 600 frames,
+// none served from a copy (24/11/2026).
+uint32_t plat_mem_early_gen(uint64_t addr) {
+    Chunk *c = addr < PS_LIMIT ? chunk_of(addr, 0) : NULL;
+    return c ? __atomic_load_n(&c->egen[(addr % CHUNK) / KP], __ATOMIC_ACQUIRE) : 0;
+}
+static void egen_step(uint64_t lo, uint64_t hi) {   // vm_lock held
+    for (uint64_t k = lo; k < hi; k += KP) {
+        Chunk *c = chunk_of(k, 1);
+        if (c) __atomic_add_fetch(&c->egen[(k % CHUNK) / KP], 1, __ATOMIC_RELEASE);
+    }
+}
+
+static void early_set(uint64_t k, int on) {   // vm_lock held
+    Chunk *c = chunk_of(k, 1);
+    if (!c) return;
+    size_t i = (k % CHUNK) / KP;
+    uint8_t bit = (uint8_t)(1u << (i % 8)), v = c->early[i / 8];
+    __atomic_store_n(&c->early[i / 8], on ? (uint8_t)(v | bit) : (uint8_t)(v & ~bit), __ATOMIC_RELAXED);
+}
+
+PlatEarlyResult plat_mem_early_protect(uint64_t addr, size_t n, int on, int restore_prot) {
+    (void)restore_prot;
+    uint64_t lo = addr & ~(KP - 1), hi = (addr + n + KP - 1) & ~(KP - 1);
+    if (hi > PS_LIMIT) hi = PS_LIMIT;
+    if (lo >= hi) return on ? PLAT_EARLY_FAILED : PLAT_EARLY_OK;
+    vm_take();
+    for (uint64_t k = lo; k < hi; k += KP) early_set(k, on);
+    egen_step(lo, hi);
+    int bad = 0;
+    uint64_t run = 0, run_end = 0;   // one mprotect per run of backed pages taking the same protection (as plat_mem_protect)
+    int run_prot = 0;
+    for (uint64_t k = lo; k < hi && !bad; k += KP) {
+        if (!is_backed(k)) continue;   // not backed: its first touch backs it closed (back with kpage_prot)
+        int p = kpage_prot(k);
+        if (run_end != k || p != run_prot) {
+            if (run_end > run) bad = kprot((void *)(uintptr_t)run, run_end - run, run_prot) != 0;
+            run = k, run_prot = p;
+        }
+        run_end = k + KP;
+    }
+    if (!bad && run_end > run) bad = kprot((void *)(uintptr_t)run, run_end - run, run_prot) != 0;
+    if (bad && on) {   // the prior state back: the pages open as their guest states say
+        for (uint64_t k = lo; k < hi; k += KP) early_set(k, 0);
+        for (uint64_t k = lo; k < hi; k += KP) apply(k);
+    }
+    plat_mutex_unlock(&vm_lock);
+    return !bad ? PLAT_EARLY_OK : on ? PLAT_EARLY_FAILED : PLAT_EARLY_UNRESTORED;
+}
+
+// Readable but not writable for the caller's copy (frz_lock held by the caller): the bit stays, a writer still faults
+// and waits for frz_lock in the fault hook; the caller closes it again with plat_mem_early_protect(on 1).
+int plat_mem_early_open_read(uint64_t addr, size_t n) {
+    uint64_t lo = addr & ~(KP - 1), hi = (addr + n + KP - 1) & ~(KP - 1);
+    if (hi > PS_LIMIT || lo >= hi) return 0;
+    vm_take();
+    int ok = 1;
+    for (uint64_t k = lo; k < hi && ok; k += KP)
+        if (is_backed(k)) ok = kprot((void *)(uintptr_t)k, KP, PROT_READ) == 0;
+    egen_step(lo, hi);
+    plat_mutex_unlock(&vm_lock);
+    return ok;
+}
 int plat_mem_peek(void *dst, uint64_t addr, size_t n) { return through(addr, dst, n, 0); }
 
 int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end) {
@@ -652,6 +753,7 @@ static int in_lazy(uint64_t a);
 
 void ps5_mem_prepare_write(uint64_t a, uint64_t n) {
     if (!n) return;
+    early_hold(a, n);   // the early-read watch gives its pages over the buffer up first (frz_lock, then vm_lock)
     vm_take();
     for (uint64_t k = a & ~(KP - 1); k < a + n; k += KP) {
         if (in_lazy(k)) {
@@ -676,6 +778,7 @@ void ps5_mem_prepare_write(uint64_t a, uint64_t n) {
 // range before importing it, paged_vm.cpp:545-605 in ref/Pokopia-Native-PS5), and marked so it is never given back.
 void ps5_mem_gpu_share(uint64_t a, uint64_t n) {
     if (!n) return;
+    early_hold(a, n);   // as before a kernel write (mkw-pit-stop calls its hook before imports too)
     vm_take();
     for (uint64_t k = a & ~(KP - 1); k < a + n && k < PS_LIMIT; k += KP) {
         Chunk *c = chunk_of(k, 1);   // every page counted, committed or not: ps5_mem_gpu_unshare takes the same range
@@ -790,6 +893,10 @@ static int ps5_fault(uint64_t a, int write) {
     }
     int s = st_get(a);
     if (s < PS_NONE) return 0;   // not committed: a real fault
+    // A page the early-read watch closed: the fault hook releases it (and may wait for the GPU in game code). Not the
+    // siblings' hooks below: run 120 (15/11/2026) ran them on every 4 KiB neighbour of a closed page, 382k faults and
+    // 0.1-0.4x speed. mkw-pit-stop routes these the same way (ps5_guest_memory.c:524-597 @ 0109457).
+    if (is_early(k)) return 0;
     uint64_t w0 = plat_now_ns();
     ww_lock(k);
     st_add(&st_lockwait_ns, plat_now_ns() - w0);
@@ -860,6 +967,7 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
     int segv = sig == SIGSEGV || sig == SIGBUS;   // FreeBSD reports a protection fault as SIGBUS
     if (segv && watch_fn && (err & 2) && watch_fn(a, (uint64_t)u->uc_mcontext.mc_rip)) return;
     plat_fault_write = (err & 2) != 0, plat_fault_pc = (uint64_t)u->uc_mcontext.mc_rip;
+    plat_fault_uc = uc;   // the context a hook may change (the early-read watch's emulated sibling read, ps5_fault_guard.c)
     plat_fault_ret = *(const uint64_t *)(uintptr_t)u->uc_mcontext.mc_rsp;
     int mine = segv && !(err & 16) ? ps5_fault(a, (err & 2) != 0) : 0;
     if (mine > 0) {

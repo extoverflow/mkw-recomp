@@ -20,6 +20,7 @@
 | `ps5.c`, `ps5_int.h` | PS5: threads (stacks in direct memory, sized from a measurement), interruption by signal, fibers, affinity; the header is what the `ps5*.c` parts share |
 | `ps5_main.c` | PS5: the title's entry (arguments and settings from `args.txt`, the log file, the splash, the exit through the shell; `--ps5-pad-test`, `--ps5-tone-test`) |
 | `ps5_mem.c` | PS5: reservations, direct memory backed at the first touch per 16 KiB page, the 4 KiB guest state, faults and crashes |
+| `ps5_fault_guard.c` | PS5: the early-read watch's sibling-read emulation (a faulting load, CMP or TEST decoded, its bytes read, the instruction skipped) with the code read from the title's own executable (its text cannot be read in memory), and a guarded copy; from mkw-pit-stop (MIT) |
 | `ps5_frontend.c` | PS5: stand-ins for the parts of the SDL3 front end a console has no use for (keyboard, mouse, start screen) |
 | `ps5_window.c` | PS5: the window back end (`gfx_wsys.h`) on the one display through RADV's `VK_KHR_display` |
 | `ps5_sdl.c` (with `../ps5_sdl/SDL3/SDL.h`) | PS5: the SDL3 subset `input/input.c` and `audio/audio_mixer.c` call, on scePad and sceAudioOut |
