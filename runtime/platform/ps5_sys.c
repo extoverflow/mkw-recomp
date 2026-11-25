@@ -21,10 +21,12 @@
 #include "platform.h"
 #include "ps5_int.h"
 
-uintptr_t plat_exe_base(void) {
-    Dl_info d;
-    return dladdr((void *)plat_exe_base, &d) ? (uintptr_t)d.dli_fbase : 0;
-}
+// The image's load address: lld defines __ehdr_start at the image's first byte (VA 0 in llvm-pie.elf). dladdr's
+// dli_fbase was 0 on the console (build 219c's start-up line, 24/11/2026: base 0x400000, dladdr 0), so every "exe+"
+// offset in the logs was an absolute address and the code reader of ps5_fault_guard.c read the wrong file bytes. As in
+// mkw-pit-stop (MIT; PS5 work by exploitizm) runtime/platform/ps5_sys.c:148-152 @ 0109457.
+extern const char __ehdr_start[] __attribute__((weak, visibility("hidden")));
+uintptr_t plat_exe_base(void) { return (uintptr_t)__ehdr_start; }
 
 int plat_module_of(uintptr_t addr, char *name, size_t cap, uintptr_t *base) {
     Dl_info d;
