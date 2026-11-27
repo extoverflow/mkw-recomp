@@ -484,3 +484,23 @@ const SDL_DisplayMode *SDL_GetCurrentDisplayMode(SDL_DisplayID displayID) {
                           .refresh_rate_numerator = 60, .refresh_rate_denominator = 1};
     return &m;
 }
+
+// SDL_hints.h (ps5_sdl/SDL3/SDL.h): no hints here; accepted so input.c's Steam Input path builds unchanged.
+bool SDL_SetHintWithPriority(const char *name, const char *value, SDL_HintPriority priority) {
+    (void)name, (void)value, (void)priority;
+    return true;
+}
+
+// SDL_joystick.h's GUID calls (ps5_sdl/SDL3/SDL.h): the pad's vendor as SDL_GetGamepadVendor gives it, product 0.
+SDL_GUID SDL_GetGamepadGUIDForID(SDL_JoystickID instance_id) {
+    SDL_GUID g = {{0}};
+    if (instance_id) g.data[4] = 0x4c, g.data[5] = 0x05;
+    return g;
+}
+
+void SDL_GetJoystickGUIDInfo(SDL_GUID guid, Uint16 *vendor, Uint16 *product, Uint16 *version, Uint16 *crc16) {
+    if (vendor) *vendor = (Uint16)(guid.data[4] | guid.data[5] << 8);
+    if (product) *product = (Uint16)(guid.data[8] | guid.data[9] << 8);
+    if (version) *version = (Uint16)(guid.data[12] | guid.data[13] << 8);
+    if (crc16) *crc16 = (Uint16)(guid.data[2] | guid.data[3] << 8);
+}

@@ -121,6 +121,11 @@ typedef enum SDL_PowerState {
 } SDL_PowerState;
 SDL_GamepadType SDL_GetGamepadType(SDL_Gamepad *gamepad);
 Uint16 SDL_GetGamepadVendor(SDL_Gamepad *gamepad);
+// SDL_joystick.h's GUID (upstream 104c3dd2's input.c reads a pad's own ids through it): SDL's layout, vendor in bytes
+// 4-5 and product in 8-9, little-endian; the console's pad gives Sony's vendor id, as SDL_GetGamepadVendor does.
+typedef struct SDL_GUID { Uint8 data[16]; } SDL_GUID;
+SDL_GUID SDL_GetGamepadGUIDForID(SDL_JoystickID instance_id);
+void SDL_GetJoystickGUIDInfo(SDL_GUID guid, Uint16 *vendor, Uint16 *product, Uint16 *version, Uint16 *crc16);
 SDL_PowerState SDL_GetGamepadPowerInfo(SDL_Gamepad *gamepad, int *percent);
 SDL_PropertiesID SDL_GetGamepadProperties(SDL_Gamepad *gamepad);
 SDL_GamepadButtonLabel SDL_GetGamepadButtonLabel(SDL_Gamepad *gamepad, SDL_GamepadButton button);
@@ -175,6 +180,12 @@ typedef struct SDL_DisplayMode {
 } SDL_DisplayMode;
 SDL_DisplayID SDL_GetPrimaryDisplay(void);
 const SDL_DisplayMode *SDL_GetCurrentDisplayMode(SDL_DisplayID displayID);
+
+// ---- SDL_hints.h: input/input.c's Steam Input path sets one hint (upstream 104c3dd2); the PS5 has no Steam Input and
+// no SDL hints, so it is taken and ignored (platform/ps5_sdl.c).
+typedef enum SDL_HintPriority { SDL_HINT_DEFAULT, SDL_HINT_NORMAL, SDL_HINT_OVERRIDE } SDL_HintPriority;
+#define SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES "SDL_GAMECONTROLLER_IGNORE_DEVICES"
+bool SDL_SetHintWithPriority(const char *name, const char *value, SDL_HintPriority priority);
 
 #ifdef __cplusplus
 }

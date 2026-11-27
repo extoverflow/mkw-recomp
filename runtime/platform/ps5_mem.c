@@ -460,7 +460,7 @@ void *plat_mem_alloc(size_t n) {
 
 // Windows lazy commit (memory.c lazy_fault): not needed here, the fault handler backs a committed page at its first
 // touch as Linux does (linux_mem.c:270 plat_mem_lazy_hook, a no-op).
-void plat_mem_lazy_hook(int (*fn)(uint64_t addr)) { (void)fn; }
+void plat_mem_lazy_hook(int (*fn)(uint64_t addr, int write)) { (void)fn; }
 
 int plat_mem_commit(uint64_t addr, size_t n) {
     vm_take();
@@ -644,6 +644,14 @@ static void ww_close_run(uint64_t run, uint64_t run_end, int prot) {
         if (w) *w = (uint16_t)(*w & ~(WW_ALL << WW_PEND_SHIFT) & ~(*w >> WW_PEND_SHIFT & WW_ALL));   // hot/score kept
     }
 }
+
+// The guest's 4 KiB pages are what this layer tracks and protects (per 4 KiB states in Chunk.state, faults on a 16 KiB
+// kernel page resolved per 4 KiB page through the sibling hooks), so the rest of the runtime keeps its 4 KiB paths:
+// the host page reported is 4 KiB and no guest page is left more accessible than asked. Reporting the kernel's 16 KiB
+// would turn on the large-page paths of linux_mem.c's design (read traps and MKW_EARLY_READ off, 16 KiB write-watch
+// pages for uploads), a behaviour change of its own.
+uint64_t plat_page_size(void) { return PG; }
+uint64_t plat_mem_loose_pages(uint64_t addr, uint64_t n) { (void)addr, (void)n; return 0; }
 
 // The committed 4 KiB pages marked written, in address order. reset: those reported are unmarked, and their 16 KiB
 // pages closed to writes again. A range that is not wholly watched is untracked.
